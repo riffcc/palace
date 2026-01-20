@@ -1,0 +1,28 @@
+[Unit]
+Description=Palace Director daemon (%i)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wings
+Group=wings
+WorkingDirectory=/home/wings/projects/palace-2026-v2
+
+# Instance name is the Director name (e.g., alpha, beta, gamma)
+# Model can be set via environment file
+Environment=PALACE_PROJECT_PATH=/home/wings/projects/palace-2026-v2
+EnvironmentFile=-/home/wings/.config/palace/director-%i.env
+
+ExecStart=/home/wings/projects/palace-2026-v2/target/release/palace-director %i $DIRECTOR_MODEL
+
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=palace-director-%i
+
+[Install]
+WantedBy=multi-user.target

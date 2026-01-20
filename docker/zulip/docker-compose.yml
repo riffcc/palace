@@ -1,0 +1,123 @@
+version: "3"
+
+services:
+  database:
+    image: "zulip/zulip-postgresql:14"
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "zulip"
+      POSTGRES_USER: "zulip"
+      POSTGRES_PASSWORD: "zulip_password"
+    volumes:
+      - "postgresql-14:/var/lib/postgresql/data:rw"
+
+  memcached:
+    image: "memcached:alpine"
+    restart: unless-stopped
+    command:
+      - "sh"
+      - "-euc"
+      - |
+        echo 'mech_list: plain' > "$$SASL_CONF_PATH"
+        echo "zulip@$$HOSTNAME:$$MEMCACHED_PASSWORD" > "$$MEMCACHED_SASL_PWDB"
+        echo "Starting memcached..."
+        exec memcached -S
+    environment:
+      SASL_CONF_PATH: "/home/memcache/memcached.conf"
+      MEMCACHED_SASL_PWDB: "/home/memcache/memcached-sasl-db"
+      MEMCACHED_PASSWORD: "memcached_password"
+
+  rabbitmq:
+    image: "rabbitmq:3.11.16"
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: "zulip"
+      RABBITMQ_DEFAULT_PASS: "rabbitmq_password"
+    volumes:
+      - "rabbitmq:/var/lib/rabbitmq:rw"
+
+  redis:
+    image: "redis:alpine"
+    restart: unless-stopped
+    command:
+      - "sh"
+      - "-euc"
+      - |
+        echo "requirepass '$$REDIS_PASSWORD'" > /etc/redis.conf
+        exec redis-server /etc/redis.conf
+    environment:
+      REDIS_PASSWORD: "redis_password"
+    volumes:
+      - "redis:/data:rw"
+
+  zulip:
+    image: "zulip/docker-zulip:8.3-0"
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "8443:443"
+    environment:
+      # Core settings
+      DISABLE_HTTPS: "true"
+      SETTING_EXTERNAL_HOST: "localhost:8080"
+      SETTING_ZULIP_ADMINISTRATOR: "admin@localhost"
+      SETTING_EMAIL_HOST: ""
+      SETTING_EMAIL_HOST_USER: ""
+      SETTING_EMAIL_PORT: ""
+      SETTING_EMAIL_USE_SSL: ""
+      SETTING_EMAIL_USE_TLS: ""
+
+      # Database
+      SECRETS_postgres_password: "zulip_password"
+      SETTING_DATABASES: |
+        {
+          "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "HOST": "database",
+            "PORT": "5432",
+            "NAME": "zulip",
+            "USER": "zulip",
+            "PASSWORD": "zulip_password"
+          }
+        }
+
+      # RabbitMQ
+      SECRETS_rabbitmq_password: "rabbitmq_password"
+      SETTING_RABBITMQ_HOST: "rabbitmq"
+      SETTING_RABBITMQ_USER: "zulip"
+
+      # Redis
+      SECRETS_redis_password: "redis_password"
+      SETTING_REDIS_HOST: "redis"
+      SETTING_REDIS_PORT: "6379"
+
+      # Memcached
+      SECRETS_memcached_password: "memcached_password"
+      SETTING_MEMCACHED_LOCATION: "memcached:11211"
+
+      # Required secret key (generate with: openssl rand -base64 50)
+      SECRETS_secret_key: "REPLACE_WITH_SECURE_SECRET_KEY_CHANGE_ME_NOW"
+
+      # Development mode
+      SETTING_DEVELOPMENT: "false"
+      SETTING_DEBUG: "false"
+
+      # Email backend for development (no actual emails)
+      SETTING_EMAIL_BACKEND: "django.core.mail.backends.console.EmailBackend"
+
+      # Allow registration without email verification
+      SETTING_OPEN_REALM_CREATION: "true"
+
+    volumes:
+      - "zulip:/data:rw"
+    depends_on:
+      - database
+      - memcached
+      - rabbitmq
+      - redis
+
+volumes:
+  postgresql-14:
+  rabbitmq:
+  redis:
+  zulip:

@@ -1,0 +1,25 @@
+[package]
+name = "palace-ci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Palace CI integration with Dagger - configurable build/test/run pipelines"
+
+# Attribution: This crate integrates with Dagger (Apache 2.0 Licensed)
+# https://github.com/dagger/dagger/tree/main/sdk/rust
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dagger-sdk.workspace = true
+eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+tracing-subscriber.workspace = true

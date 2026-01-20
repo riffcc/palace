@@ -1,0 +1,20 @@
+[package]
+name = "palace-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Plane.so integration and task management for Palace"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+llm-code-sdk = { path = "../llm-code-sdk" }
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+regex = "1"
+tokio.workspace = true
+tracing.workspace = true

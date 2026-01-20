@@ -1,0 +1,45 @@
+[package]
+name = "director"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Autonomous project management director for Palace"
+
+# Director: The AI project manager that orchestrates development
+# according to goals, creates issues, prioritizes work, and coordinates
+# the entire development lifecycle autonomously.
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = { version = "0.7", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy.workspace = true
+futures.workspace = true
+html-escape = "0.2"
+llm-code-sdk = { path = "../llm-code-sdk" }
+mountain = { path = "../mountain" }
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+users = "0.11"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Plane.so and Zulip integration
+reqwest.workspace = true
+
+[[bin]]
+name = "palace-director"
+path = "src/bin/palace-director.rs"
+
+[dev-dependencies]
+tokio-test.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []

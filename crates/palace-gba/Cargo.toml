@@ -1,0 +1,36 @@
+[package]
+name = "palace-gba"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "GBA emulation integration for Palace using rustboyadvance-ng"
+
+[dependencies]
+# GBA emulation
+rustboyadvance-core = { git = "https://github.com/michelhe/rustboyadvance-ng" }
+rustboyadvance-utils = { git = "https://github.com/michelhe/rustboyadvance-ng" }
+
+# Audio
+tinyaudio = "0.1"
+
+# Image encoding for LLM vision
+base64 = "0.22"
+png = "0.18"
+
+# Bit manipulation for keypad
+bit = "0.1"
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true

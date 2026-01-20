@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Palace Director - Project Graph</title>
+    <style>
+        body { margin: 0; background: #0a0a0f; color: #e0e0e0; font-family: system-ui; }
+        #graph { width: 100vw; height: 100vh; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            max-width: 300px;
+        }
+        #info h1 { margin: 0 0 10px 0; font-size: 18px; color: #22c55e; }
+        #events {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            max-width: 400px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        #events h2 { margin: 0 0 10px 0; font-size: 14px; color: #3b82f6; }
+        .event { font-size: 12px; margin: 4px 0; padding: 4px; background: #1a1a2e; border-radius: 4px; }
+        .event.focus { border-left: 3px solid #22c55e; }
+        .event.create { border-left: 3px solid #3b82f6; }
+        .event.complete { border-left: 3px solid #8b5cf6; }
+        .event.move { border-left: 3px solid #f59e0b; }
+        #stats { font-size: 12px; color: #888; }
+    </style>
+    <script src="https://unpkg.com/3d-force-graph@1"></script>
+</head>
+<body>
+    <div id="graph"></div>
+
+    <div id="info">
+        <h1>Palace Director</h1>
+        <div id="stats">Loading...</div>
+    </div>
+
+    <div id="events">
+        <h2>Live Events</h2>
+        <div id="event-list"></div>
+    </div>
+
+    <script>
+        const Graph = ForceGraph3D()
+            (document.getElementById('graph'))
+            .backgroundColor('#0a0a0f')
+            .nodeAutoColorBy('node_type')
+            .nodeLabel(node => `${node.name} (${node.status})`)
+            .nodeVal(node => node.node_type === 'agent' ? 20 : 10)
+            .linkDirectionalArrowLength(3.5)
+            .linkDirectionalArrowRelPos(1)
+            .linkCurvature(0.2)
+            .linkLabel(link => link.link_type)
+            .onNodeClick(node => {
+                const distance = 100;
+                const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
+                Graph.cameraPosition(
+                    { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
+                    node,
+                    1000
+                );
+            });
+
+        // Color mapping
+        const typeColors = {
+            'module': '#22c55e',
+            'cycle': '#3b82f6',
+            'issue': '#8b5cf6',
+            'file': '#6b7280',
+            'agent': '#f59e0b'
+        };
+
+        Graph.nodeColor(node => typeColors[node.node_type] || '#888');
+
+        // Fetch initial data
+        async function loadGraph() {
+            const response = await fetch('/api/graph');
+            const data = await response.json();
+
+            // Transform to 3d-force-graph format
+            const graphData = {
+                nodes: data.nodes.map(n => ({
+                    id: n.id,
+                    name: n.name,
+                    node_type: n.node_type,
+                    status: n.status,
+                    x: n.x,
+                    y: n.y,
+                    z: n.z
+                })),
+                links: data.links.map(l => ({
+                    source: l.source,
+                    target: l.target,
+                    link_type: l.link_type
+                }))
+            };
+
+            Graph.graphData(graphData);
+            updateStats(data);
+        }
+
+        function updateStats(data) {
+            const modules = data.nodes.filter(n => n.node_type === 'module').length;
+            const cycles = data.nodes.filter(n => n.node_type === 'cycle').length;
+            const issues = data.nodes.filter(n => n.node_type === 'issue').length;
+
+            document.getElementById('stats').innerHTML = `
+                Modules: ${modules} | Cycles: ${cycles} | Issues: ${issues}<br>
+                Links: ${data.links.length}
+            `;
+        }
+
+        // WebSocket for live updates
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            addEvent(data);
+
+            // Update graph based on event
+            if (data.type === 'IssueCreated' || data.type === 'IssueLinkCreated') {
+                loadGraph();
+            }
+
+            if (data.type === 'AgentMoved') {
+                // Animate agent movement
+                const agentNode = Graph.graphData().nodes.find(n => n.id === 'agent');
+                const targetNode = Graph.graphData().nodes.find(n => n.id === data.to);
+                if (agentNode && targetNode) {
+                    agentNode.x = targetNode.x;
+                    agentNode.y = targetNode.y;
+                    agentNode.z = targetNode.z;
+                    Graph.refresh();
+                }
+            }
+        };
+
+        function addEvent(event) {
+            const list = document.getElementById('event-list');
+            const div = document.createElement('div');
+
+            let className = 'event';
+            let text = '';
+
+            switch (event.type) {
+                case 'IssueFocused':
+                    className += ' focus';
+                    text = `→ ${event.title}`;
+                    break;
+                case 'IssueCreated':
+                    className += ' create';
+                    text = `+ ${event.title}`;
+                    break;
+                case 'IssueCompleted':
+                    className += ' complete';
+                    text = `✓ ${event.issue_id}`;
+                    break;
+                case 'AgentMoved':
+                    className += ' move';
+                    text = `Agent: ${event.from} → ${event.to}`;
+                    break;
+                default:
+                    text = JSON.stringify(event);
+            }
+
+            div.className = className;
+            div.textContent = text;
+            list.insertBefore(div, list.firstChild);
+
+            // Keep only last 50 events
+            while (list.children.length > 50) {
+                list.removeChild(list.lastChild);
+            }
+        }
+
+        // Initial load
+        loadGraph();
+
+        // Refresh periodically
+        setInterval(loadGraph, 30000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Always optimize the emulator, even in debug builds
+[profile.dev.package.rustboyadvance-core]
+opt-level = 3
+
+[profile.dev.package.arm7tdmi]
+opt-level = 3
+
+[profile.dev.package.palace-gba]
+opt-level = 3
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+authors = ["Riff.CC"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dagger-sdk = "0.19"
+dotenvy = "0.15"
+eyre = "0.6"
+futures = "0.3"
+glob = "0.3"
+playwright-rs = "0.8"
+redb = "2"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-test = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }

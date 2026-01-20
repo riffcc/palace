@@ -1,0 +1,1736 @@
+//! Palace: AI-assisted software development with gamepad control.
+//!
+//! This is the main binary that ties together:
+//! - Mountain: Time-delayed cascading LLM control
+//! - Conductor: Recursive interview UI with gamepad
+//! - Director: Autonomous project management
+//! - Palace-GBA: GBA emulation integration
+//! - Palace-render: Dual-screen wgpu rendering
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Play a GBA ROM
+//! palace play --rom /path/to/pokemon.gba --bios /path/to/bios.bin
+//!
+//! # Run in project mode (AI-assisted development)
+//! palace project --path /path/to/project
+//! ```
+
+mod app;
+mod config;
+mod gamepad;
+mod gba_controllable;
+mod inference;
+
+use anyhow::Context;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tracing::info;
+
+#[derive(Parser)]
+#[command(name = "palace")]
+#[command(about = "AI-assisted software development with gamepad control")]
+#[command(version)]
+struct Cli {
+    /// LM Studio endpoint URL
+    #[arg(long, default_value = "http://localhost:1234/v1")]
+    lm_studio: String,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Play a GBA ROM with AI assistance
+    Play {
+        /// Path to GBA ROM file
+        #[arg(long)]
+        rom: PathBuf,
+
+        /// Path to GBA BIOS
+        #[arg(long)]
+        bios: PathBuf,
+
+        /// Enable turbo mode (uncapped framerate)
+        #[arg(long)]
+        turbo: bool,
+    },
+
+    /// AI-assisted project development
+    Project {
+        /// Path to project directory
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Project name
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Show connected gamepads
+    Gamepads,
+
+    /// Test LM Studio connection
+    TestLlm {
+        /// Prompt to send
+        #[arg(default_value = "Hello, what model are you?")]
+        prompt: String,
+    },
+
+    /// Generate suggestions for what to do next
+    Next {
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// List pending or active tasks
+    Ls {
+        /// Show active tasks from Plane.so instead of pending
+        #[arg(long)]
+        active: bool,
+
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Remove pending tasks by number
+    Rm {
+        /// Task numbers to remove (e.g., 1,4,5,8,2)
+        numbers: String,
+
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Approve pending tasks and create Plane.so issues
+    Approve {
+        /// Task numbers to approve (e.g., 1,2,3,5,6)
+        numbers: String,
+
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Call a Palace tool directly (for Claude Code integration)
+    Call {
+        /// Tool name: create-issue, list-issues, update-issue
+        tool: String,
+
+        /// JSON input for the tool
+        #[arg(long)]
+        input: Option<String>,
+
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Plane.so workspace slug (auto-init if needed)
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Plane.so project slug (auto-init if needed)
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Run the Palace daemon with live visualization
+    Daemon {
+        /// Project directory (defaults to current)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Web server port for visualization
+        #[arg(long, default_value = "3456")]
+        port: u16,
+
+        /// LM Studio URL
+        #[arg(long, default_value = "http://localhost:1234/v1")]
+        llm_url: String,
+
+        /// Model to use
+        #[arg(long, default_value = "glm-4-plus")]
+        model: String,
+
+        /// Enable run recording
+        #[arg(long)]
+        record: bool,
+    },
+
+    /// Manage agent sessions
+    #[command(subcommand)]
+    Session(SessionCommands),
+
+    /// Run the Director daemon (autonomous project manager)
+    Director {
+        /// Node name (machine identifier, e.g., "tealc")
+        #[arg(short, long)]
+        node: String,
+
+        /// Director specs: name:model pairs (e.g., "alpha:flash", "beta:lm:/qwen3-8b")
+        /// Model prefixes: lm:/ (LM Studio), z:/ (Z.ai), or:/ (OpenRouter), ms:/ (Mistral)
+        #[arg(required = true)]
+        directors: Vec<String>,
+
+        /// Zulip stream to use
+        #[arg(long, default_value = "palace")]
+        stream: String,
+
+        /// Verbosity level: quiet, normal, verbose
+        #[arg(long, default_value = "normal")]
+        verbosity: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// List active sessions
+    Ls {
+        /// Show all sessions (including completed)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// View session logs
+    Log {
+        /// Session ID or name
+        session: String,
+
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show
+        #[arg(short, long)]
+        lines: Option<usize>,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Create a new session
+    Create {
+        /// Target: issue ID (PAL-123), module name, or cycle name
+        target: String,
+
+        /// Execution strategy: simple, parallel, priority
+        #[arg(short, long, default_value = "simple")]
+        strategy: String,
+
+        /// Run immediately after creation
+        #[arg(short, long)]
+        run: bool,
+
+        /// Run in background (implies --run)
+        #[arg(short, long)]
+        background: bool,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// LM Studio URL
+        #[arg(long, default_value = "http://localhost:1234/v1")]
+        llm_url: String,
+
+        /// Model to use
+        #[arg(long, default_value = "glm-4-plus")]
+        model: String,
+    },
+
+    /// Cancel a session
+    Cancel {
+        /// Session ID or name
+        session: String,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Show session details
+    Info {
+        /// Session ID or name
+        session: String,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Run an existing session
+    Run {
+        /// Session ID or name
+        session: String,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// LM Studio URL
+        #[arg(long, default_value = "http://localhost:1234/v1")]
+        llm_url: String,
+
+        /// Model to use
+        #[arg(long, default_value = "glm-4-plus")]
+        model: String,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
+    // Load .env file
+    dotenvy::dotenv().ok();
+
+    let cli = Cli::parse();
+
+    // Initialize logging - respect RUST_LOG env var, with sensible defaults
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        if cli.verbose {
+            "palace=debug,palace_plane=debug,palace_gba=debug,mountain=debug,conductor=debug,director=debug,llm_code_sdk=debug".to_string()
+        } else {
+            "palace=info,palace_plane=info,palace_gba=info,mountain=info,conductor=info,director=info".to_string()
+        }
+    });
+
+    tracing_subscriber::fmt()
+        .with_env_filter(&filter)
+        .init();
+
+    info!("Palace starting...");
+
+    match cli.command {
+        Commands::Play { rom, bios, turbo } => {
+            app::run_play(rom, bios, turbo, &cli.lm_studio)?;
+        }
+
+        Commands::Project { path, name } => {
+            app::run_project(path, name, &cli.lm_studio)?;
+        }
+
+        Commands::Gamepads => {
+            gamepad::list_gamepads()?;
+        }
+
+        Commands::TestLlm { prompt } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(inference::test_connection(&cli.lm_studio, &prompt))?;
+        }
+
+        Commands::Next { path } => {
+            let rt = tokio::runtime::Runtime::new()?;
+
+            // Print welcome banner
+            println!("\n\x1b[1;36m🏛️  Palace\x1b[0m\n");
+            println!("\x1b[33m📡 Exploring your codebase...\x1b[0m");
+
+            // Create callback to print tool events
+            let callback = {
+                std::sync::Arc::new(move |event: palace_plane::ExplorationEvent| {
+                    match event {
+                        palace_plane::ExplorationEvent::ToolCall { name, input } => {
+                            match name.as_str() {
+                                "read_file" => {
+                                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                                        println!("\x1b[90m📖 Read {}\x1b[0m", path);
+                                    }
+                                }
+                                "list_directory" => {
+                                    let path = input.get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(".");
+                                    println!("\x1b[90m📂 List {}\x1b[0m", path);
+                                }
+                                "grep" => {
+                                    if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+                                        println!("\x1b[90m🔍 Search '{}'\x1b[0m", pattern);
+                                    }
+                                }
+                                "glob" => {
+                                    if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+                                        println!("\x1b[90m🔎 Glob {}\x1b[0m", pattern);
+                                    }
+                                }
+                                "suggest" => {
+                                    println!("\x1b[90m💡 Generating suggestions...\x1b[0m");
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                })
+            };
+
+            let tasks = rt.block_on(palace_plane::generate_next_with_callback(
+                &path,
+                &cli.lm_studio,
+                Some(callback),
+            ))?;
+
+            println!();
+            if tasks.is_empty() {
+                println!("No suggestions generated.");
+            } else {
+                for (_id, task) in &tasks {
+                    println!("○ {}", task.title);
+                }
+                println!();
+                println!("\x1b[90mUse 'palace ls' to see pending tasks, 'palace approve <n>' to create issues.\x1b[0m");
+            }
+        }
+
+        Commands::Ls { active, path } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            if active {
+                let config = palace_plane::ProjectConfig::load(&path)?;
+                let tasks = rt.block_on(palace_plane::list_active(&path))?;
+
+                if tasks.is_empty() {
+                    println!("No active tasks in Plane.so.");
+                } else {
+                    println!("Active tasks in {}/{} ({}):\n",
+                        config.workspace, config.project_slug, tasks.len());
+                    for task in &tasks {
+                        println!("  [{}-{}] {}",
+                            config.project_slug.to_uppercase(), task.sequence_id, task.name);
+                    }
+                }
+            } else {
+                let tasks = palace_plane::list_pending(&path)?;
+
+                if tasks.is_empty() {
+                    println!("No pending tasks. Run 'palace next' to generate suggestions.");
+                } else {
+                    println!("Pending tasks ({}):\n", tasks.len());
+                    for (i, (id, task)) in tasks.iter().enumerate() {
+                        println!("  {}. [PENDING-{}] {}", i + 1, id, task.title);
+                        if let Some(desc) = &task.description {
+                            if let Some(first_line) = desc.lines().next() {
+                                println!("     {}", first_line);
+                            }
+                        }
+                    }
+                    println!("\nUse 'palace approve <numbers>' to create Plane.so issues.");
+                    println!("Use 'palace rm <numbers>' to remove tasks.");
+                }
+            }
+        }
+
+        Commands::Rm { numbers, path } => {
+            let indices = parse_numbers(&numbers)?;
+            let removed = palace_plane::remove_pending(&path, &indices)?;
+
+            if removed.is_empty() {
+                println!("No tasks removed.");
+            } else {
+                println!("Removed {} task(s):", removed.len());
+                for (id, task) in &removed {
+                    println!("  [PENDING-{}] {}", id, task.title);
+                }
+            }
+        }
+
+        Commands::Approve { numbers, path } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let config = palace_plane::ProjectConfig::load(&path)?;
+            let indices = parse_numbers(&numbers)?;
+            let results = rt.block_on(palace_plane::approve_tasks(&path, &indices))?;
+
+            if results.is_empty() {
+                println!("No tasks approved.");
+            } else {
+                println!("Approved {} task(s):\n", results.len());
+                for (task, issue) in &results {
+                    println!("  [{}-{}] {}",
+                        config.project_slug.to_uppercase(), issue.sequence_id, task.title);
+                }
+            }
+        }
+
+        Commands::Call { tool, input, path, workspace, project } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(handle_call(&tool, input.as_deref(), &path, workspace.as_deref(), project.as_deref()))?;
+        }
+
+        Commands::Daemon { path, port, llm_url, model, record } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let project_path = path.canonicalize()
+                    .context("Failed to resolve project path")?;
+
+                let config = director::DaemonConfig {
+                    project_path,
+                    llm_url_override: Some(llm_url),
+                    model,
+                    web_addr: format!("127.0.0.1:{}", port).parse()
+                        .context("Invalid port")?,
+                    record,
+                    record_path: if record {
+                        Some(std::path::PathBuf::from("palace_daemon_recording.json"))
+                    } else {
+                        None
+                    },
+                    analysis_interval_secs: 30,
+                    zulip_enabled: false,
+                    zulip_stream: "palace".to_string(),
+                };
+
+                info!("Starting Palace Daemon...");
+                info!("Visualization: http://127.0.0.1:{}", port);
+
+                let daemon = director::Daemon::new(config)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                daemon.run().await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+
+        Commands::Session(cmd) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(handle_session_command(cmd))?;
+        }
+
+        Commands::Director { node, directors, stream, verbosity } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                // Parse verbosity
+                let verbosity = match verbosity.as_str() {
+                    "quiet" => director::Verbosity::Quiet,
+                    "verbose" => director::Verbosity::Verbose,
+                    "debug" => director::Verbosity::Debug,
+                    _ => director::Verbosity::Normal,
+                };
+
+                // Create pool
+                let mut pool = director::Pool::new(&node)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?
+                    .with_verbosity(verbosity)
+                    .with_stream(&stream);
+
+                // Add directors
+                for spec in &directors {
+                    let (name, model) = if let Some((n, m)) = spec.split_once(':') {
+                        (n.to_string(), m.to_string())
+                    } else {
+                        (spec.clone(), "flash".to_string())
+                    };
+                    pool.add(&name, &model)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    info!("Added director '{}' with model '{}'", name, model);
+                }
+
+                // Run the pool
+                let project_path = std::env::current_dir()?;
+                pool.run(project_path).await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle session subcommands.
+async fn handle_session_command(cmd: SessionCommands) -> anyhow::Result<()> {
+    use director::{SessionManager, SessionStrategy, SessionTarget};
+
+    match cmd {
+        SessionCommands::Ls { all, path } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = SessionManager::new(project_path);
+
+            let sessions = if all {
+                manager.list_sessions().await
+            } else {
+                manager.list_active().await
+            };
+
+            if sessions.is_empty() {
+                if all {
+                    println!("No sessions found.");
+                } else {
+                    println!("No active sessions. Use 'palace session create <target>' to start one.");
+                }
+            } else {
+                println!("Sessions ({}):\n", sessions.len());
+                for s in &sessions {
+                    let duration = s.duration()
+                        .map(|d| format!("{}s", d.num_seconds()))
+                        .unwrap_or_else(|| "-".to_string());
+
+                    let progress = if s.tasks_total > 0 {
+                        format!("{}/{}", s.tasks_completed, s.tasks_total)
+                    } else {
+                        "-".to_string()
+                    };
+
+                    // Status with color
+                    let status = match s.status {
+                        director::SessionStatus::Running => format!("\x1b[32m{}\x1b[0m", s.status),
+                        director::SessionStatus::Completed => format!("\x1b[34m{}\x1b[0m", s.status),
+                        director::SessionStatus::Failed => format!("\x1b[31m{}\x1b[0m", s.status),
+                        _ => format!("{}", s.status),
+                    };
+
+                    println!("  {} {} [{}] {} ({}) {}",
+                        s.short_id(),
+                        s.name,
+                        status,
+                        s.target,
+                        s.strategy,
+                        progress);
+
+                    if let Some(task) = &s.current_task {
+                        println!("      → {}", task);
+                    }
+                    if let Some(branch) = &s.branch {
+                        println!("      \x1b[90mbranch: {}\x1b[0m", branch);
+                    }
+                }
+            }
+        }
+
+        SessionCommands::Log { session, follow, lines, path } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = SessionManager::new(project_path);
+
+            let sess = manager.find_session(&session).await
+                .context(format!("Session not found: {}", session))?;
+
+            if follow {
+                // Subscribe to live events
+                let mut rx = manager.subscribe();
+                let session_id = sess.id;
+
+                // Print existing logs first
+                let logs = manager.get_logs(session_id, lines).await;
+                for entry in &logs {
+                    print_log_entry(entry);
+                }
+
+                println!("\x1b[90m--- Following session {} (Ctrl+C to stop) ---\x1b[0m", sess.short_id());
+
+                // Follow new events
+                loop {
+                    match rx.recv().await {
+                        Ok(director::SessionEvent::Log { session_id: id, entry }) if id == session_id => {
+                            print_log_entry(&entry);
+                        }
+                        Ok(director::SessionEvent::StatusChanged { session_id: id, status }) if id == session_id => {
+                            println!("\x1b[33m[STATUS] {}\x1b[0m", status);
+                            if matches!(status, director::SessionStatus::Completed | director::SessionStatus::Failed | director::SessionStatus::Cancelled) {
+                                break;
+                            }
+                        }
+                        Ok(director::SessionEvent::Progress { session_id: id, completed, total, current }) if id == session_id => {
+                            println!("\x1b[36m[{}/{}] {}\x1b[0m", completed, total, current);
+                        }
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            } else {
+                let logs = manager.get_logs(sess.id, lines).await;
+                if logs.is_empty() {
+                    println!("No log entries for session {}.", sess.short_id());
+                } else {
+                    for entry in &logs {
+                        print_log_entry(entry);
+                    }
+                }
+            }
+        }
+
+        SessionCommands::Create { target, strategy, run, background, path, llm_url, model } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = std::sync::Arc::new(SessionManager::new(project_path.clone()));
+
+            // Parse target
+            let session_target = parse_session_target(&target)?;
+
+            // Parse strategy
+            let session_strategy: SessionStrategy = strategy.parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+
+            let session = manager.create_session(session_target, session_strategy).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Created session: {} ({})", session.name, session.short_id());
+            println!("  Target: {}", session.target);
+            println!("  Strategy: {}", session.strategy);
+            if let Some(branch) = &session.branch {
+                println!("  Branch: {}", branch);
+            }
+            if let Some(worktree) = &session.worktree_path {
+                println!("  Worktree: {}", worktree.display());
+            }
+
+            // Run immediately if requested
+            let should_run = run || background;
+            if should_run {
+                println!();
+
+                let exec_config = director::SessionExecutorConfig {
+                    llm_url,
+                    model,
+                    max_tokens: 4096,
+                    workspace: "wings".to_string(),
+                    project: "PAL".to_string(),
+                    zulip_enabled: false,
+                    zulip_stream: "palace".to_string(),
+                };
+
+                let mut executor = director::SessionExecutor::new(exec_config, manager.clone());
+
+                if background {
+                    // TODO: Background execution with process spawning
+                    println!("\x1b[33mBackground execution not yet implemented. Running in foreground.\x1b[0m");
+                }
+
+                println!("Starting session execution...\n");
+
+                match executor.execute(session.id).await {
+                    Ok(()) => {
+                        println!("\n\x1b[32mSession completed successfully!\x1b[0m");
+                    }
+                    Err(e) => {
+                        println!("\n\x1b[31mSession failed: {}\x1b[0m", e);
+                    }
+                }
+            } else {
+                println!("\n\x1b[90mUse 'palace session run {}' to execute.\x1b[0m", session.short_id());
+            }
+        }
+
+        SessionCommands::Cancel { session, path } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = SessionManager::new(project_path);
+
+            let sess = manager.find_session(&session).await
+                .context(format!("Session not found: {}", session))?;
+
+            manager.cancel_session(sess.id).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Cancelled session: {} ({})", sess.name, sess.short_id());
+        }
+
+        SessionCommands::Info { session, path } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = SessionManager::new(project_path);
+
+            let sess = manager.find_session(&session).await
+                .context(format!("Session not found: {}", session))?;
+
+            println!("Session: {} ({})", sess.name, sess.id);
+            println!("  Status: {}", sess.status);
+            println!("  Target: {}", sess.target);
+            println!("  Strategy: {}", sess.strategy);
+            println!("  Created: {}", sess.created_at);
+            if let Some(started) = sess.started_at {
+                println!("  Started: {}", started);
+            }
+            if let Some(completed) = sess.completed_at {
+                println!("  Completed: {}", completed);
+            }
+            if sess.tasks_total > 0 {
+                println!("  Progress: {}/{}", sess.tasks_completed, sess.tasks_total);
+            }
+            if let Some(task) = &sess.current_task {
+                println!("  Current: {}", task);
+            }
+            if let Some(branch) = &sess.branch {
+                println!("  Branch: {}", branch);
+            }
+            if let Some(worktree) = &sess.worktree_path {
+                println!("  Worktree: {}", worktree.display());
+            }
+            if let Some(err) = &sess.error {
+                println!("  \x1b[31mError: {}\x1b[0m", err);
+            }
+        }
+
+        SessionCommands::Run { session, path, llm_url, model } => {
+            let project_path = path.canonicalize()
+                .context("Failed to resolve project path")?;
+            let manager = std::sync::Arc::new(SessionManager::new(project_path));
+
+            let sess = manager.find_session(&session).await
+                .context(format!("Session not found: {}", session))?;
+
+            if !sess.is_active() && sess.status != director::SessionStatus::Starting {
+                anyhow::bail!("Session {} is already {}", sess.short_id(), sess.status);
+            }
+
+            println!("Running session: {} ({})", sess.name, sess.short_id());
+            println!("  Target: {}", sess.target);
+            println!("  Strategy: {}", sess.strategy);
+            println!();
+
+            // Create executor config
+            let exec_config = director::SessionExecutorConfig {
+                llm_url,
+                model,
+                max_tokens: 4096,
+                workspace: "wings".to_string(),
+                project: "PAL".to_string(),
+                zulip_enabled: false,
+                zulip_stream: "palace".to_string(),
+            };
+
+            // Create and run executor
+            let mut executor = director::SessionExecutor::new(exec_config, manager.clone());
+
+            match executor.execute(sess.id).await {
+                Ok(()) => {
+                    println!("\n\x1b[32mSession completed successfully!\x1b[0m");
+                }
+                Err(e) => {
+                    println!("\n\x1b[31mSession failed: {}\x1b[0m", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_log_entry(entry: &director::SessionLogEntry) {
+    let level_color = match entry.level {
+        director::LogLevel::Debug => "\x1b[90m",
+        director::LogLevel::Info => "\x1b[0m",
+        director::LogLevel::Warn => "\x1b[33m",
+        director::LogLevel::Error => "\x1b[31m",
+    };
+    let time = entry.timestamp.format("%H:%M:%S");
+    println!("{}{} [{}] {}\x1b[0m", level_color, time, format!("{:?}", entry.level).to_uppercase(), entry.message);
+}
+
+fn parse_session_target(target: &str) -> anyhow::Result<director::SessionTarget> {
+    // Check for multiple comma-separated targets
+    if target.contains(',') {
+        let targets: Vec<director::SingleTarget> = target
+            .split(',')
+            .map(|t| parse_single_target(t.trim()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        return Ok(director::SessionTarget::multi(targets));
+    }
+
+    // Single target
+    Ok(director::SessionTarget::Single(parse_single_target(target)?))
+}
+
+fn parse_single_target(target: &str) -> anyhow::Result<director::SingleTarget> {
+    // Check for explicit prefixes
+    if let Some(id) = target.strip_prefix("issue:") {
+        return Ok(director::SingleTarget::Issue(id.to_string()));
+    }
+    if let Some(id) = target.strip_prefix("module:") {
+        return Ok(director::SingleTarget::Module(id.to_string()));
+    }
+    if let Some(id) = target.strip_prefix("cycle:") {
+        return Ok(director::SingleTarget::Cycle(id.to_string()));
+    }
+    if let Some(id) = target.strip_prefix("goal:") {
+        return Ok(director::SingleTarget::Goal(id.to_string()));
+    }
+
+    // Auto-detect based on format
+    // PAL-123 format = issue
+    if target.contains('-') && target.split('-').last().map(|s| s.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) {
+        return Ok(director::SingleTarget::Issue(target.to_string()));
+    }
+
+    // M001-xxx format = module
+    if target.starts_with("M0") || target.starts_with("m0") {
+        return Ok(director::SingleTarget::Module(target.to_string()));
+    }
+
+    // C0.x.x format = cycle
+    if target.starts_with("C0") || target.starts_with("c0") || target.starts_with("v0") {
+        return Ok(director::SingleTarget::Cycle(target.to_string()));
+    }
+
+    // Default to issue
+    Ok(director::SingleTarget::Issue(target.to_string()))
+}
+
+/// Handle tool calls for Claude Code integration.
+///
+/// Available tools:
+/// - smart_read: Token-efficient code reading with layered analysis
+/// - smart_write: Structure-aware code editing
+/// - plane_create_issue: Create Plane.so issue
+/// - plane_list_issues: List Plane.so issues
+/// - tools: List available tools
+async fn handle_call(
+    tool: &str,
+    input: Option<&str>,
+    path: &std::path::Path,
+    workspace: Option<&str>,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
+    use llm_code_sdk::tools::Tool;
+    use std::collections::HashMap;
+
+    // Parse JSON input if provided
+    // Note: Shell escaping can turn `!` into `\!` which is invalid JSON.
+    // We unescape it here since `\!` is never valid JSON anyway.
+    let input_map: HashMap<String, serde_json::Value> = if let Some(json) = input {
+        let unescaped = json.replace("\\!", "!");
+        serde_json::from_str(&unescaped).context("Invalid JSON input")?
+    } else {
+        HashMap::new()
+    };
+
+    // Resolve project path
+    let project_path = path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
+
+    match tool {
+        "smart_read" => {
+            let smart_read = llm_code_sdk::tools::smart::SmartReadTool::new(&project_path);
+            let result = smart_read.call(input_map.clone()).await;
+
+            // JECJIT: Inject related issue context if project config exists
+            let jecjit_context = inject_jecjit_context(&project_path, &input_map).await;
+            if !jecjit_context.is_empty() && !result.is_error() {
+                let enhanced = format!("{}\n{}", result.to_content_string(), jecjit_context);
+                println!("{}", enhanced);
+            } else {
+                print_tool_result(&result);
+            }
+        }
+
+        "smart_write" => {
+            let smart_write = llm_code_sdk::tools::smart::SmartWriteTool::new(&project_path);
+            let result = smart_write.call(input_map.clone()).await;
+
+            // JECJIT: Surface related issues for the file being written
+            let jecjit_context = inject_jecjit_context(&project_path, &input_map).await;
+            if !jecjit_context.is_empty() && !result.is_error() {
+                let enhanced = format!("{}\n{}", result.to_content_string(), jecjit_context);
+                println!("{}", enhanced);
+            } else {
+                print_tool_result(&result);
+            }
+        }
+
+        "search" => {
+            let search = llm_code_sdk::tools::SearchTool::new(&project_path);
+            let result = search.call(input_map).await;
+            print_tool_result(&result);
+        }
+
+        "plane" => {
+            // Unified Plane.so API tool - systemd style
+            // verb [object_type] [params] - object_type defaults to "issue"
+            let verb = input_map.get("verb")
+                .and_then(|v| v.as_str())
+                .context("plane requires 'verb' (list, get, create, update, delete)")?;
+
+            let object_type = input_map.get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("issue");
+
+            let ws = input_map.get("workspace").and_then(|v| v.as_str())
+                .or(workspace)
+                .unwrap_or("wings");
+
+            handle_plane(verb, object_type, ws, &input_map).await?;
+        }
+
+        "zulip" => {
+            let zulip = director::ZulipTool::from_env()
+                .map_err(|e| anyhow::anyhow!("Zulip not configured: {}", e))?;
+
+            let verb = input_map.get("verb")
+                .and_then(|v| v.as_str())
+                .unwrap_or("send");
+
+            match verb {
+                "send" => {
+                    let stream = input_map.get("stream")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("palace");
+                    let topic = input_map.get("topic")
+                        .and_then(|v| v.as_str())
+                        .context("zulip send requires 'topic'")?;
+                    let content = input_map.get("content")
+                        .and_then(|v| v.as_str())
+                        .context("zulip send requires 'content'")?;
+
+                    let msg_id = zulip.send(stream, topic, content).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    println!("Sent message {} to {}/{}", msg_id, stream, topic);
+                }
+                "messages" | "get" => {
+                    let stream = input_map.get("stream")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("palace");
+                    let topic = input_map.get("topic")
+                        .and_then(|v| v.as_str());
+                    let limit = input_map.get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10) as u32;
+
+                    let messages = zulip.get_messages(stream, topic, limit).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    for msg in messages {
+                        println!("---\n{}", msg.content);
+                    }
+                }
+                "poll" => {
+                    let stream = input_map.get("stream")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("palace");
+                    let topic = input_map.get("topic")
+                        .and_then(|v| v.as_str())
+                        .context("zulip poll requires 'topic'")?;
+                    let question = input_map.get("question")
+                        .and_then(|v| v.as_str())
+                        .context("zulip poll requires 'question'")?;
+                    let options: Vec<&str> = input_map.get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+
+                    let msg_id = zulip.send_poll(stream, topic, question, &options).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    println!("Created poll {} in {}/{}", msg_id, stream, topic);
+                }
+                _ => anyhow::bail!("Unknown zulip verb: '{}'. Use: send, messages, poll", verb),
+            }
+        }
+
+        "tools" | "list" | "help" => {
+            println!("Available Palace tools (not in Claude Code):\n");
+            println!("  smart_read       Token-efficient code reading with 5-layer analysis");
+            println!("                   Layers: raw, ast, call_graph, cfg, dfg, pdg");
+            println!("                   Input: {{\"path\": \"...\", \"layer\": \"ast\", \"symbol\": \"...\"}}");
+            println!("                   Batch: {{\"reads\": [{{\"path\": \"...\", \"layer\": \"...\"}}, ...]}}");
+            println!();
+            println!("  smart_write      Structure-aware code editing");
+            println!("                   Operations: replace_function, replace_symbol, insert_after, delete, replace_lines");
+            println!("                   Input: {{\"path\": \"...\", \"operation\": \"...\", \"target\": \"...\", \"content\": \"...\"}}");
+            println!();
+            println!("  search           MRS-based semantic code search");
+            println!("                   Input: {{\"query\": \"...\", \"limit\": \"10\"}}");
+            println!("                   Indexes codebase on demand, returns ranked results");
+            println!();
+            println!("  plane            Unified Plane.so API (systemd-style)");
+            println!("                   Format: {{\"verb\": \"...\", \"type\": \"...\", ...}}");
+            println!("                   Type defaults to 'issue' if omitted");
+            println!();
+            println!("                   Verbs: list, get, create, update, delete, raw");
+            println!("                   Types: project, issue, cycle, module, label, state, member");
+            println!();
+            println!("  zulip            Zulip messaging API");
+            println!("                   Verbs: send, messages, poll");
+            println!();
+            println!("                   Examples:");
+            println!("                     {{\"verb\": \"send\", \"stream\": \"palace\", \"topic\": \"test\", \"content\": \"Hello!\"}}");
+            println!("                     {{\"verb\": \"messages\", \"stream\": \"palace\", \"topic\": \"director/tealc\", \"limit\": 5}}");
+            println!("                     {{\"verb\": \"poll\", \"topic\": \"votes\", \"question\": \"Yes?\", \"options\": [\"Yes\", \"No\"]}}");
+            println!();
+            println!("Usage: pal call <tool> --input '<json>'");
+        }
+
+        _ => {
+            anyhow::bail!(
+                "Unknown tool: '{}'\nRun 'pal call tools' to see available tools.",
+                tool
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_tool_result(result: &llm_code_sdk::tools::ToolResult) {
+    if result.is_error() {
+        eprintln!("Error: {}", result.to_content_string());
+        std::process::exit(1);
+    } else {
+        println!("{}", result.to_content_string());
+    }
+}
+
+async fn inject_jecjit_context(
+    project_path: &std::path::Path,
+    input_map: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let config = match palace_plane::ProjectConfig::load(project_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let jecjit = palace_plane::JecjitContext::new(config);
+    if jecjit.refresh().await.is_err() {
+        return String::new();
+    }
+
+    // Load specs for gap detection
+    jecjit.load_specs(project_path);
+
+    let mut all_issues = Vec::new();
+
+    if let Some(path) = input_map.get("path").and_then(|v| v.as_str()) {
+        all_issues.extend(jecjit.context_for_file(path));
+    }
+
+    // Batch mode
+    if let Some(reads) = input_map.get("reads").and_then(|v| v.as_array()) {
+        for read in reads {
+            if let Some(path) = read.get("path").and_then(|v| v.as_str()) {
+                all_issues.extend(jecjit.context_for_file(path));
+            }
+        }
+    }
+
+    // Deduplicate by issue ID
+    let mut seen = std::collections::HashSet::new();
+    all_issues.retain(|issue| seen.insert(issue.id.clone()));
+
+    let mut output = palace_plane::JecjitContext::format_context(&all_issues);
+
+    // Surface spec gaps
+    let gaps = jecjit.spec_gaps();
+    if !gaps.is_empty() {
+        output.push_str(&palace_plane::JecjitContext::format_gaps(&gaps));
+    }
+
+    output
+}
+
+fn parse_priority(s: Option<&str>) -> palace_plane::TaskPriority {
+    match s {
+        Some("urgent") => palace_plane::TaskPriority::Urgent,
+        Some("high") => palace_plane::TaskPriority::High,
+        Some("medium") => palace_plane::TaskPriority::Medium,
+        Some("low") => palace_plane::TaskPriority::Low,
+        _ => palace_plane::TaskPriority::None,
+    }
+}
+
+/// Get existing config or auto-initialize.
+fn get_or_init_config(
+    project_path: &std::path::Path,
+    workspace: Option<&str>,
+    project: Option<&str>,
+) -> anyhow::Result<palace_plane::ProjectConfig> {
+    match palace_plane::ProjectConfig::load(project_path) {
+        Ok(config) => Ok(config),
+        Err(_) => {
+            // Auto-init
+            info!("Auto-initializing Palace for project...");
+            palace_plane::init_project(project_path, workspace, project)
+        }
+    }
+}
+
+/// Unified Plane.so API handler - systemd style.
+/// verb [type] - type defaults to "issue"
+async fn handle_plane(
+    verb: &str,
+    object_type: &str,
+    workspace: &str,
+    params: &std::collections::HashMap<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    let api_key = std::env::var("PLANE_API_KEY")
+        .context("PLANE_API_KEY not set")?;
+    let api_url = std::env::var("PLANE_API_URL")
+        .unwrap_or_else(|_| "https://api.plane.so/api/v1".to_string());
+
+    let client = reqwest::Client::new();
+
+    // Helper to get project ID (UUID) from identifier
+    async fn get_project_id(
+        client: &reqwest::Client,
+        api_url: &str,
+        api_key: &str,
+        workspace: &str,
+        project: &str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/workspaces/{}/projects/", api_url, workspace);
+        let resp: serde_json::Value = client.get(&url)
+            .header("X-API-Key", api_key)
+            .send().await?
+            .json().await?;
+
+        let projects = resp["results"].as_array()
+            .context("Invalid projects response")?;
+
+        for p in projects {
+            if p["identifier"].as_str() == Some(project) ||
+               p["id"].as_str() == Some(project) ||
+               p["name"].as_str().map(|n| n.to_lowercase()) == Some(project.to_lowercase()) {
+                return Ok(p["id"].as_str().unwrap().to_string());
+            }
+        }
+        anyhow::bail!("Project '{}' not found in workspace '{}'", project, workspace)
+    }
+
+    match (verb, object_type) {
+        // === PROJECTS ===
+        ("list", "project" | "projects") => {
+            let url = format!("{}/workspaces/{}/projects/", api_url, workspace);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(projects) = resp["results"].as_array() {
+                for p in projects {
+                    println!("{}: {} ({})",
+                        p["identifier"].as_str().unwrap_or("?"),
+                        p["name"].as_str().unwrap_or("?"),
+                        p["id"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        // === ISSUES ===
+        ("list", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required for listing issues")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            // First get states for this project
+            let states_url = format!("{}/workspaces/{}/projects/{}/states/",
+                api_url, workspace, project_id);
+            let states_resp: serde_json::Value = client.get(&states_url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+            let states: std::collections::HashMap<String, String> = states_resp["results"]
+                .as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|s| Some((s["id"].as_str()?.to_string(), s["name"].as_str()?.to_string())))
+                    .collect())
+                .unwrap_or_default();
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(issues) = resp["results"].as_array() {
+                for i in issues {
+                    let priority = i["priority"].as_str().unwrap_or("none");
+                    let state_id = i["state"].as_str().unwrap_or("");
+                    let state_name = states.get(state_id).map(|s| s.as_str()).unwrap_or("?");
+                    println!("{}-{}: {} [{}] ({})",
+                        project.to_uppercase(),
+                        i["sequence_id"].as_u64().unwrap_or(0),
+                        i["name"].as_str().unwrap_or("?"),
+                        state_name,
+                        priority);
+                }
+            }
+        }
+
+        ("get", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let issue_id = params.get("id").and_then(|v| v.as_str())
+                .context("id required (issue UUID or sequence like PAL-123)")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
+                api_url, workspace, project_id, issue_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        ("create", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let name = params.get("name").and_then(|v| v.as_str())
+                .context("name required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let mut body = serde_json::json!({
+                "name": name,
+                "project_id": project_id
+            });
+
+            // Optional fields
+            if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+                body["description_html"] = serde_json::json!(format!("<p>{}</p>", desc));
+            }
+            if let Some(p) = params.get("priority").and_then(|v| v.as_str()) {
+                body["priority"] = serde_json::json!(p);
+            }
+            if let Some(state) = params.get("state").and_then(|v| v.as_str()) {
+                body["state"] = serde_json::json!(state);
+            }
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.post(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?.json().await?;
+
+            println!("{}-{}: {}",
+                project.to_uppercase(),
+                resp["sequence_id"].as_u64().unwrap_or(0),
+                resp["name"].as_str().unwrap_or("?"));
+        }
+
+        ("update", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let issue_id = params.get("id").and_then(|v| v.as_str())
+                .context("id required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let mut body = serde_json::Map::new();
+            for (k, v) in params {
+                if !["project", "id", "workspace", "verb", "type"].contains(&k.as_str()) {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
+                api_url, workspace, project_id, issue_id);
+            let resp: serde_json::Value = client.patch(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?.json().await?;
+
+            println!("Updated: {}-{}",
+                project.to_uppercase(),
+                resp["sequence_id"].as_u64().unwrap_or(0));
+        }
+
+        ("delete", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let issue_id = params.get("id").and_then(|v| v.as_str())
+                .context("id required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
+                api_url, workspace, project_id, issue_id);
+            client.delete(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?;
+
+            println!("Deleted: {}", issue_id);
+        }
+
+        // === CYCLES ===
+        ("list", "cycle" | "cycles") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/cycles/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(cycles) = resp["results"].as_array() {
+                for c in cycles {
+                    println!("{}: {} ({} - {})",
+                        c["id"].as_str().unwrap_or("?"),
+                        c["name"].as_str().unwrap_or("?"),
+                        c["start_date"].as_str().unwrap_or("?"),
+                        c["end_date"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        ("create", "cycle" | "cycles") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let name = params.get("name").and_then(|v| v.as_str())
+                .context("name required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let body = serde_json::json!({
+                "name": name,
+                "start_date": params.get("start_date").and_then(|v| v.as_str()),
+                "end_date": params.get("end_date").and_then(|v| v.as_str())
+            });
+
+            let url = format!("{}/workspaces/{}/projects/{}/cycles/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.post(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?.json().await?;
+
+            println!("Created cycle: {}", resp["name"].as_str().unwrap_or("?"));
+        }
+
+        // === MODULES ===
+        ("list", "module" | "modules") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/modules/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(modules) = resp["results"].as_array() {
+                for m in modules {
+                    println!("{}: {}",
+                        m["id"].as_str().unwrap_or("?"),
+                        m["name"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        ("create", "module" | "modules") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let name = params.get("name").and_then(|v| v.as_str())
+                .context("name required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let body = serde_json::json!({"name": name});
+
+            let url = format!("{}/workspaces/{}/projects/{}/modules/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.post(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?.json().await?;
+
+            println!("Created module: {}", resp["name"].as_str().unwrap_or("?"));
+        }
+
+        // === LABELS ===
+        ("list", "label" | "labels") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/labels/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(labels) = resp["results"].as_array() {
+                for l in labels {
+                    println!("{}: {} ({})",
+                        l["id"].as_str().unwrap_or("?"),
+                        l["name"].as_str().unwrap_or("?"),
+                        l["color"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        // === STATES ===
+        ("list", "state" | "states") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let url = format!("{}/workspaces/{}/projects/{}/states/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            if let Some(states) = resp["results"].as_array() {
+                for s in states {
+                    println!("{}: {} [{}]",
+                        s["id"].as_str().unwrap_or("?"),
+                        s["name"].as_str().unwrap_or("?"),
+                        s["group"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        // === MEMBERS ===
+        ("list", "member" | "members") => {
+            let project = params.get("project").and_then(|v| v.as_str());
+
+            let url = if let Some(proj) = project {
+                let project_id = get_project_id(&client, &api_url, &api_key, workspace, proj).await?;
+                format!("{}/workspaces/{}/projects/{}/members/",
+                    api_url, workspace, project_id)
+            } else {
+                format!("{}/workspaces/{}/members/", api_url, workspace)
+            };
+
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            // Handle both array and paginated response
+            let members = resp.as_array()
+                .or_else(|| resp["results"].as_array());
+
+            if let Some(members) = members {
+                for m in members {
+                    let member = &m["member"];
+                    println!("{}: {} <{}>",
+                        member["id"].as_str().unwrap_or("?"),
+                        member["display_name"].as_str()
+                            .or(member["first_name"].as_str())
+                            .unwrap_or("?"),
+                        member["email"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+
+        // === BATCH UPDATE ===
+        ("batch", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            // Get updates array: [{"id": "...", "state": "...", ...}, ...]
+            let updates = params.get("updates").and_then(|v| v.as_array())
+                .context("updates array required")?;
+
+            for update in updates {
+                let issue_id = update.get("id").and_then(|v| v.as_str())
+                    .context("each update needs 'id'")?;
+
+                // Resolve sequence ID (like "39") to UUID if needed
+                let resolved_id = if issue_id.chars().all(|c| c.is_ascii_digit()) {
+                    // It's a sequence number, look it up
+                    let seq: u64 = issue_id.parse()?;
+                    let list_url = format!("{}/workspaces/{}/projects/{}/issues/",
+                        api_url, workspace, project_id);
+                    let list_resp: serde_json::Value = client.get(&list_url)
+                        .header("X-API-Key", &api_key)
+                        .send().await?.json().await?;
+
+                    let issues = list_resp["results"].as_array()
+                        .context("Invalid response")?;
+                    let found = issues.iter()
+                        .find(|i| i["sequence_id"].as_u64() == Some(seq))
+                        .and_then(|i| i["id"].as_str())
+                        .context(format!("Issue {} not found", issue_id))?;
+                    found.to_string()
+                } else {
+                    issue_id.to_string()
+                };
+
+                let mut body = serde_json::Map::new();
+                for (k, v) in update.as_object().unwrap() {
+                    if k != "id" {
+                        body.insert(k.clone(), v.clone());
+                    }
+                }
+
+                let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
+                    api_url, workspace, project_id, resolved_id);
+                let _resp: serde_json::Value = client.patch(&url)
+                    .header("X-API-Key", &api_key)
+                    .json(&body)
+                    .send().await?.json().await?;
+
+                println!("Updated: {}-{}", project.to_uppercase(), issue_id);
+            }
+        }
+
+        // === QUERY ISSUES ===
+        ("query", "issue" | "issues") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            // First get states for this project
+            let states_url = format!("{}/workspaces/{}/projects/{}/states/",
+                api_url, workspace, project_id);
+            let states_resp: serde_json::Value = client.get(&states_url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+            let states: std::collections::HashMap<String, String> = states_resp["results"]
+                .as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|s| Some((s["id"].as_str()?.to_string(), s["name"].as_str()?.to_string())))
+                    .collect())
+                .unwrap_or_default();
+
+            let url = format!("{}/workspaces/{}/projects/{}/issues/",
+                api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            let issues = resp["results"].as_array().context("Invalid response")?;
+
+            // Apply filters
+            let state_filter = params.get("state").and_then(|v| v.as_str());
+            let priority_filter = params.get("priority").and_then(|v| v.as_str());
+            let search = params.get("search").and_then(|v| v.as_str());
+
+            for i in issues {
+                let state_id = i["state"].as_str().unwrap_or("");
+                let state_name = states.get(state_id).map(|s| s.as_str()).unwrap_or("?");
+                let priority = i["priority"].as_str().unwrap_or("none");
+                let name = i["name"].as_str().unwrap_or("?");
+                let seq = i["sequence_id"].as_u64().unwrap_or(0);
+                let uuid = i["id"].as_str().unwrap_or("?");
+
+                // Apply filters
+                if let Some(sf) = state_filter {
+                    if !state_name.to_lowercase().contains(&sf.to_lowercase()) &&
+                       !state_id.contains(sf) {
+                        continue;
+                    }
+                }
+                if let Some(pf) = priority_filter {
+                    if priority != pf {
+                        continue;
+                    }
+                }
+                if let Some(s) = search {
+                    if !name.to_lowercase().contains(&s.to_lowercase()) {
+                        continue;
+                    }
+                }
+
+                println!("{}-{}: {} [{}] ({}) -> {}",
+                    project.to_uppercase(), seq, name, state_name, priority, uuid);
+            }
+        }
+
+        // === RAW API CALL ===
+        ("raw", _) => {
+            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let path = params.get("path").and_then(|v| v.as_str())
+                .context("path required for raw API call")?;
+            let body = params.get("body");
+
+            let url = format!("{}{}", api_url, path);
+
+            let mut req = match method.to_uppercase().as_str() {
+                "GET" => client.get(&url),
+                "POST" => client.post(&url),
+                "PATCH" => client.patch(&url),
+                "PUT" => client.put(&url),
+                "DELETE" => client.delete(&url),
+                _ => anyhow::bail!("Unknown method: {}", method),
+            };
+
+            req = req.header("X-API-Key", &api_key);
+
+            if let Some(b) = body {
+                req = req.json(b);
+            }
+
+            let resp: serde_json::Value = req.send().await?.json().await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        // === COMPARE ===
+        ("compare", _) => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let files: Vec<String> = params.get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+
+            if files.is_empty() {
+                anyhow::bail!("files required (array of spec file paths to compare against)");
+            }
+
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            // Fetch current issues
+            let url = format!("{}/workspaces/{}/projects/{}/issues/", api_url, workspace, project_id);
+            let resp: serde_json::Value = client.get(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?.json().await?;
+
+            let issues: Vec<palace_plane::api::PlaneIssue> = resp["results"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|i| {
+                    Some(palace_plane::api::PlaneIssue {
+                        id: i["id"].as_str()?.to_string(),
+                        sequence_id: i["sequence_id"].as_u64()? as u32,
+                        name: i["name"].as_str()?.to_string(),
+                        description_html: i["description_html"].as_str().map(|s| s.to_string()),
+                        state: i["state"].as_str().map(|s| s.to_string()),
+                        priority: i["priority"].as_str().map(|s| s.to_string()),
+                    })
+                }).collect())
+                .unwrap_or_default();
+
+            let lm_url = std::env::var("LM_STUDIO_URL")
+                .unwrap_or_else(|_| "http://localhost:1234/v1".to_string());
+
+            let request = palace_plane::comparison::CompareRequest {
+                spec_files: files,
+                check_code: params.get("check_code").and_then(|v| v.as_bool()).unwrap_or(false),
+                check_plane: true,
+                project_path: params.get("project_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            };
+
+            let result = palace_plane::comparison::compare(request, &issues, &lm_url).await?;
+
+            println!("{}", result.summary);
+            if !result.gaps.is_empty() {
+                println!("\n## Gaps ({}):", result.gaps.len());
+                for gap in &result.gaps {
+                    println!("- {} [{}]", gap.description, format!("{:?}", gap.gap_type));
+                    if let Some(action) = &gap.suggested_action {
+                        println!("  → {}", action);
+                    }
+                }
+            }
+            if !result.matches.is_empty() {
+                println!("\n## Matches ({}):", result.matches.len());
+                for m in result.matches.iter().take(10) {
+                    println!("- {} ✓ ({})", m.description, m.evidence);
+                }
+            }
+        }
+
+        _ => {
+            anyhow::bail!("Unknown: {} {}\nVerbs: list, get, create, update, delete, compare, raw\nTypes: project, issue, cycle, module, label, state, member", verb, object_type);
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse comma-separated numbers.
+fn parse_numbers(s: &str) -> anyhow::Result<Vec<usize>> {
+    s.split(',')
+        .map(|n| n.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Invalid number format. Use comma-separated numbers like: 1,2,3")
+}

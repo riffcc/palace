@@ -1,0 +1,64 @@
+[package]
+name = "palace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Palace: AI-assisted software development with gamepad control"
+
+[[bin]]
+name = "pal"
+path = "src/main.rs"
+
+[dependencies]
+# Palace crates
+conductor = { path = "../conductor" }
+director = { path = "../director" }
+llm-code-sdk = { path = "../llm-code-sdk", features = ["smart", "search"] }
+mountain = { path = "../mountain" }
+palace-gba = { path = "../palace-gba" }
+palace-plane = { path = "../palace-plane" }
+palace-render = { path = "../palace-render" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+futures.workspace = true
+async-trait = "0.1"
+
+# Gamepad input
+gilrs = "0.11"
+
+# HTTP client for LM Studio
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+png = "0.17"
+chrono = "0.4"
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Environment
+dotenvy.workspace = true
+
+# Window/rendering
+winit = "0.30"
+wgpu = "28"
+pollster = "0.4"
+
+# Frame timing
+spin_sleep = "1"
+
+[features]
+default = []
