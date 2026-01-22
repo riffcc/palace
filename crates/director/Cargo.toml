@@ -20,6 +20,7 @@ futures.workspace = true
 html-escape = "0.2"
 llm-code-sdk = { path = "../llm-code-sdk" }
 mountain = { path = "../mountain" }
+palace-plane = { path = "../palace-plane" }
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true

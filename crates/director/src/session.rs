@@ -395,7 +395,8 @@ impl Session {
     /// Create a new session.
     pub fn new(target: SessionTarget, strategy: SessionStrategy, project_path: PathBuf) -> Self {
         let id = Uuid::new_v4();
-        let name = format!("session-{}", &id.to_string()[..8]);
+        // Name based on target (e.g., "PAL-53") not UUID garbage
+        let name = target.to_string();
 
         Self {
             id,

@@ -14,25 +14,50 @@ pub struct ZulipTool {
 }
 
 impl ZulipTool {
-    /// Create from environment variables.
+    /// Create Director bot from credentials.
     pub fn from_env() -> DirectorResult<Self> {
+        Self::from_env_director()
+    }
+
+    /// Create Director bot from credentials.
+    pub fn from_env_director() -> DirectorResult<Self> {
         let _ = dotenvy::dotenv();
+        let creds = palace_plane::Credentials::load()
+            .map_err(|e| DirectorError::Config(e.to_string()))?;
 
-        let server_url = std::env::var("ZULIP_SERVER_URL")
-            .unwrap_or_else(|_| "https://localhost:8443".to_string());
+        let server_url = creds.zulip_server_url()
+            .unwrap_or_else(|| "https://localhost:8443".to_string());
 
-        // Use Director bot credentials
-        let email = std::env::var("DIRECTOR_BOT_EMAIL")
-            .or_else(|_| std::env::var("ZULIP_BOT_EMAIL"))
-            .map_err(|_| DirectorError::Config("DIRECTOR_BOT_EMAIL or ZULIP_BOT_EMAIL not set".into()))?;
+        let email = creds.director_bot_email()
+            .ok_or_else(|| DirectorError::Config("Director bot email not configured".into()))?;
 
-        let api_key = std::env::var("DIRECTOR_API_KEY")
-            .or_else(|_| std::env::var("ZULIP_API_KEY"))
-            .map_err(|_| DirectorError::Config("DIRECTOR_API_KEY or ZULIP_API_KEY not set".into()))?;
+        let api_key = creds.director_api_key()
+            .ok_or_else(|| DirectorError::Config("Director bot API key not configured".into()))?;
 
-        let insecure = std::env::var("ZULIP_INSECURE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        let insecure = creds.zulip_insecure();
+        Self::build(server_url, email, api_key, insecure)
+    }
+
+    /// Create Palace bot from credentials.
+    pub fn from_env_palace() -> DirectorResult<Self> {
+        let _ = dotenvy::dotenv();
+        let creds = palace_plane::Credentials::load()
+            .map_err(|e| DirectorError::Config(e.to_string()))?;
+
+        let server_url = creds.zulip_server_url()
+            .unwrap_or_else(|| "https://localhost:8443".to_string());
+
+        let email = creds.palace_bot_email()
+            .ok_or_else(|| DirectorError::Config("Palace bot email not configured".into()))?;
+
+        let api_key = creds.palace_api_key()
+            .ok_or_else(|| DirectorError::Config("Palace bot API key not configured".into()))?;
+
+        let insecure = creds.zulip_insecure();
+        Self::build(server_url, email, api_key, insecure)
+    }
+
+    fn build(server_url: String, email: String, api_key: String, insecure: bool) -> DirectorResult<Self> {
 
         let client = if insecure {
             Client::builder()
@@ -246,7 +271,12 @@ impl ZulipTool {
         Ok(body.messages)
     }
 
-    /// Subscribe to a stream.
+    /// Ensure a stream exists (creates if needed) and subscribe to it.
+    pub async fn ensure_stream(&self, stream: &str) -> DirectorResult<()> {
+        self.subscribe(stream).await
+    }
+
+    /// Subscribe to a stream (creates it if it doesn't exist).
     pub async fn subscribe(&self, stream: &str) -> DirectorResult<()> {
         let url = format!("{}/api/v1/users/me/subscriptions", self.server_url);
 
