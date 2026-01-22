@@ -212,7 +212,7 @@ Optional fields: "priority" (1-5), "effort" ("S"/"M"/"L"/"XL"), "related_files" 
 
     let params = MessageCreateParams {
         model: "glm-4.7".to_string(),
-        max_tokens: 8192,
+        max_tokens: 65536,
         system: Some(SystemPrompt::Text(system_prompt)),
         messages: vec![MessageParam::user(user_prompt)],
         ..Default::default()
