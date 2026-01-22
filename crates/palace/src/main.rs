@@ -345,37 +345,95 @@ fn main() -> anyhow::Result<()> {
             println!("\n\x1b[1;36m🏛️  Palace\x1b[0m\n");
             println!("\x1b[33m📡 Exploring your codebase...\x1b[0m");
 
-            // Create callback to print tool events
+            // Setup Zulip for real-time streaming
+            let palace_dir = path.join(".palace");
+            let zulip_stream = match palace_plane::ProjectConfig::load(&path) {
+                Ok(config) => config.name.unwrap_or_else(|| "palace".to_string()),
+                Err(_) => {
+                    eprintln!("\x1b[33m⚠️  No .palace/project.yml found. Run 'pal init' to configure.\x1b[0m");
+                    "palace".to_string()
+                }
+            };
+            let zulip_topic = "suggestions";
+
+            eprintln!("[ZULIP] stream={} topic={}", zulip_stream, zulip_topic);
+
+            // Try to get Zulip tool and post initial message
+            let zulip_state: Option<(director::ZulipTool, u64, String)> =
+                match director::ZulipTool::from_env_palace() {
+                    Ok(tool) => {
+                        eprintln!("[ZULIP] tool created");
+                        if let Err(e) = rt.block_on(tool.ensure_stream(&zulip_stream)) {
+                            eprintln!("[ZULIP] ensure_stream failed: {}", e);
+                        }
+                        let initial_msg = "🔍 **Exploring codebase...**\n\n".to_string();
+                        match rt.block_on(tool.send(&zulip_stream, zulip_topic, &initial_msg)) {
+                            Ok(msg_id) => {
+                                eprintln!("[ZULIP] posted id={}", msg_id);
+                                Some((tool, msg_id, initial_msg))
+                            }
+                            Err(e) => {
+                                eprintln!("[ZULIP] send failed: {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ZULIP] from_env_palace failed: {}", e);
+                        None
+                    }
+                };
+
+            // Channel for non-blocking Zulip updates
+            let (zulip_tx, mut zulip_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let zulip_tx_for_callback = zulip_tx.clone();
+
+            // Spawn SEPARATE THREAD for Zulip updates (can't use rt.spawn - it blocks)
+            let zulip_handle = if let Some((tool, msg_id, initial_content)) = zulip_state {
+                Some(std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let mut content = initial_content;
+                    while let Some(line) = rt.block_on(zulip_rx.recv()) {
+                        content.push_str(&format!("{}\n", line));
+                        if let Err(e) = rt.block_on(tool.update_message(msg_id, &content)) {
+                            eprintln!("[ZULIP] update failed: {}", e);
+                        }
+                    }
+                    (tool, msg_id, content)
+                }))
+            } else {
+                None
+            };
+
+            // Create callback that streams to terminal and sends to Zulip channel
             let callback = {
                 std::sync::Arc::new(move |event: palace_plane::ExplorationEvent| {
                     match event {
                         palace_plane::ExplorationEvent::ToolCall { name, input } => {
-                            match name.as_str() {
+                            let line = match name.as_str() {
                                 "read_file" => {
-                                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-                                        println!("\x1b[90m📖 Read {}\x1b[0m", path);
-                                    }
+                                    input.get("path").and_then(|v| v.as_str())
+                                        .map(|p| format!("📖 {}", p))
                                 }
                                 "list_directory" => {
-                                    let path = input.get("path")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(".");
-                                    println!("\x1b[90m📂 List {}\x1b[0m", path);
+                                    let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                                    Some(format!("📂 {}", p))
                                 }
                                 "grep" => {
-                                    if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-                                        println!("\x1b[90m🔍 Search '{}'\x1b[0m", pattern);
-                                    }
+                                    input.get("pattern").and_then(|v| v.as_str())
+                                        .map(|p| format!("🔍 {}", p))
                                 }
                                 "glob" => {
-                                    if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-                                        println!("\x1b[90m🔎 Glob {}\x1b[0m", pattern);
-                                    }
+                                    input.get("pattern").and_then(|v| v.as_str())
+                                        .map(|p| format!("🔎 {}", p))
                                 }
-                                "suggest" => {
-                                    println!("\x1b[90m💡 Generating suggestions\x1b[0m");
-                                }
-                                _ => {}
+                                "suggest" => Some("💡 Generating...".to_string()),
+                                _ => None,
+                            };
+
+                            if let Some(line) = line {
+                                println!("\x1b[90m{}\x1b[0m", line);
+                                let _ = zulip_tx_for_callback.send(line);
                             }
                         }
                         _ => {}
@@ -390,68 +448,51 @@ fn main() -> anyhow::Result<()> {
                 cli.lm_studio.as_deref(),
             ))?;
 
+            // Drop sender to signal background thread to finish, then wait for it
+            drop(zulip_tx);
+            let zulip_final = zulip_handle.and_then(|h| h.join().ok());
+
             println!();
             if tasks.is_empty() {
                 println!("No suggestions generated.");
+                if let Some((tool, msg_id, _)) = &zulip_final {
+                    let _ = rt.block_on(tool.update_message(*msg_id, "No suggestions generated."));
+                }
             } else {
-                // Show raw suggestions first
+                // Show raw suggestions in terminal
                 for stored in &tasks {
                     println!("{}. {}", stored.index, stored.task.title);
                 }
 
-                // Stream = project name, topic = "suggestions"
-                let project_config = palace_plane::ProjectConfig::load(&path).ok();
-                let zulip_stream = project_config.as_ref()
-                    .and_then(|c| c.name.clone())
-                    .unwrap_or_else(|| {
-                        path.canonicalize()
-                            .ok()
-                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                            .unwrap_or_else(|| "palace".to_string())
-                    });
-                let zulip_topic = "suggestions";
+                // Convert for formatting
+                let tasks_for_zulip: Vec<(usize, palace_plane::PendingTask)> = tasks
+                    .iter()
+                    .map(|s| (s.index, s.task.clone()))
+                    .collect();
 
-                // Connect to Zulip if configured (Palace bot)
-                let zulip_tool = match director::ZulipTool::from_env_palace() {
-                    Ok(tool) => {
-                        // Ensure stream exists before sending
-                        if let Err(e) = rt.block_on(tool.ensure_stream(&zulip_stream)) {
-                            eprintln!("\x1b[33mFailed to create Zulip stream: {}\x1b[0m", e);
-                        }
-                        Some(tool)
+                // Update the streaming Zulip message with final suggestions
+                if let Some((tool, msg_id, _)) = &zulip_final {
+                    let merged = format_merged_suggestions(&tasks_for_zulip);
+                    if let Err(e) = rt.block_on(tool.update_message(*msg_id, &merged)) {
+                        eprintln!("\x1b[33m⚠️  Failed to update Zulip: {}\x1b[0m", e);
                     }
-                    Err(_) => {
-                        eprintln!("\x1b[33mZulip not configured. Set PALACE_BOT_EMAIL and PALACE_API_KEY to stream suggestions.\x1b[0m");
-                        None
+
+                    // Post poll as separate message
+                    let poll = format_suggestions_poll(&tasks_for_zulip);
+                    if let Err(e) = rt.block_on(tool.send(&zulip_stream, "suggestions", &poll)) {
+                        eprintln!("\x1b[33m⚠️  Failed to send poll: {}\x1b[0m", e);
                     }
-                };
 
-                // Progressive enhancement phase
-                println!("\n\x1b[33m🔮 Enhancing suggestions with plans and relations...\x1b[0m\n");
+                    println!("\x1b[32m✓ Streamed {} suggestions to Zulip\x1b[0m\n", tasks.len());
+                }
 
-                // Channel for sending enhanced tasks to Zulip
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, palace_plane::PendingTask)>(16);
+                // Progressive enhancement phase (silent from Zulip perspective)
+                println!("\x1b[33m🔮 Enhancing suggestions with plans and relations...\x1b[0m\n");
 
-                // Spawn Zulip sender task
-                let zulip_handle = if let Some(tool) = zulip_tool {
-                    let stream_clone = zulip_stream.clone();
-                    let topic_clone = zulip_topic.clone();
-                    Some(rt.spawn(async move {
-                        while let Some((index, task)) = rx.recv().await {
-                            let content = format_suggestion_markdown(index, &task);
-                            if let Err(e) = tool.send(&stream_clone, &topic_clone, &content).await {
-                                eprintln!("\x1b[33m⚠️  Failed to send to Zulip: {}\x1b[0m", e);
-                            }
-                        }
-                    }))
-                } else {
-                    // Drain channel if no Zulip
-                    rt.spawn(async move { while rx.recv().await.is_some() {} });
-                    None
-                };
+                // Collect all enhanced tasks
+                let enhanced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let enhanced_clone = enhanced.clone();
 
-                // Enhancement callback that prints and sends to channel
-                let tx_clone = tx.clone();
                 let enhancement_callback = {
                     std::sync::Arc::new(move |index: usize, task: &palace_plane::PendingTask| {
                         // Print to terminal
@@ -490,8 +531,8 @@ fn main() -> anyhow::Result<()> {
                         }
                         println!();
 
-                        // Send to Zulip channel (non-blocking)
-                        let _ = tx_clone.try_send((index, task.clone()));
+                        // Collect for batch Zulip post
+                        enhanced_clone.lock().unwrap().push((index, task.clone()));
                     })
                 };
 
@@ -502,24 +543,7 @@ fn main() -> anyhow::Result<()> {
                     lm_url.as_deref(),
                 ))?;
 
-                // Drop sender to signal completion
-                drop(tx);
-
-                // Wait for Zulip sender to finish
-                if let Some(handle) = zulip_handle {
-                    rt.block_on(handle)?;
-                    // Send summary message
-                    if let Ok(tool) = director::ZulipTool::from_env() {
-                        let summary = format!(
-                            "**{} suggestions ready for review**\n\n\
-                            Use `@palace approve 1,2,3` to approve suggestions and create Plane issues.",
-                            tasks.len()
-                        );
-                        rt.block_on(tool.send(&zulip_stream, &zulip_topic, &summary)).ok();
-                    }
-                }
-
-                println!("\x1b[90mUse 'pal approve <n>' to create issues, 'pal rm <n>' to remove.\x1b[0m");
+                println!("\x1b[90mUse 'pal approve <n>' or '@palace approve 1,2,3' in Zulip.\x1b[0m");
             }
         }
 
@@ -2132,6 +2156,70 @@ fn format_suggestion_markdown(index: usize, task: &palace_plane::PendingTask) ->
     }
 
     content
+}
+
+/// Format all suggestions as ONE merged markdown message.
+fn format_merged_suggestions(tasks: &[(usize, palace_plane::PendingTask)]) -> String {
+    let mut content = String::from("# 🏛️ Suggestions\n\n");
+
+    for (index, task) in tasks {
+        // Compact format: ### #N Title
+        content.push_str(&format!("### #{} {}\n", index, task.title));
+
+        if let Some(desc) = &task.description {
+            content.push_str(desc);
+            content.push_str("\n\n");
+        }
+
+        // Plan as numbered list
+        if let Some(plan) = &task.plan {
+            for (i, step) in plan.iter().enumerate() {
+                content.push_str(&format!("{}. {}\n", i + 1, step));
+            }
+            content.push('\n');
+        }
+
+        // Relations inline
+        if let Some(relations) = &task.relations {
+            if !relations.is_empty() {
+                let rel_strs: Vec<String> = relations.iter().map(|rel| {
+                    let rel_type = match rel.relation_type {
+                        palace_plane::RelationType::DependsOn => "→",
+                        palace_plane::RelationType::Blocks => "⊢",
+                        palace_plane::RelationType::RelatedTo => "~",
+                    };
+                    format!("{} #{}", rel_type, rel.target_index)
+                }).collect();
+                content.push_str(&format!("*{}*\n\n", rel_strs.join(", ")));
+            }
+        }
+
+        content.push_str("---\n\n");
+    }
+
+    content.push_str(&format!(
+        "**{}** suggestions • `@palace approve 1,2,3` to create issues",
+        tasks.len()
+    ));
+
+    content
+}
+
+/// Format suggestions as a Zulip poll for voting.
+fn format_suggestions_poll(tasks: &[(usize, palace_plane::PendingTask)]) -> String {
+    let mut poll = String::from("/poll What should we work on?\n");
+
+    for (index, task) in tasks {
+        // Short title, truncated if needed
+        let title = if task.title.len() > 50 {
+            format!("{}...", &task.title[..47])
+        } else {
+            task.title.clone()
+        };
+        poll.push_str(&format!("{}: {}\n", index, title));
+    }
+
+    poll
 }
 
 /// Parse comma-separated numbers.
