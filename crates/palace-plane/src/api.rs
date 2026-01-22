@@ -1,19 +1,83 @@
-//! Plane.so API client.
+//! Plane.so API client with rate limiting.
 
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::task::PendingTask;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
 
-/// Plane.so API client.
+/// Rate limiter for Plane.so API.
+/// Uses token bucket algorithm: 10 requests per second, burst of 5.
+pub struct RateLimiter {
+    tokens: f64,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: f64, refill_rate: f64) -> Self {
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Wait for a token, blocking if necessary.
+    pub async fn acquire(&mut self) {
+        // Refill tokens based on elapsed time
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.last_refill = now;
+
+        // If no tokens available, wait
+        if self.tokens < 1.0 {
+            let wait_time = (1.0 - self.tokens) / self.refill_rate;
+            tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
+            self.tokens = 1.0;
+            self.last_refill = Instant::now();
+        }
+
+        self.tokens -= 1.0;
+    }
+}
+
+/// Global rate limiter instance.
+/// Plane.so allows 60 requests/minute, so we use 1.0 req/sec with burst of 5.
+static RATE_LIMITER: std::sync::OnceLock<Arc<Mutex<RateLimiter>>> = std::sync::OnceLock::new();
+
+/// Get the shared rate limiter for Plane.so API calls.
+/// All code making Plane API calls should use this to avoid rate limits.
+pub fn get_rate_limiter() -> Arc<Mutex<RateLimiter>> {
+    RATE_LIMITER.get_or_init(|| {
+        // Plane.so: 60 requests/minute = 1 req/sec average
+        // We use slightly conservative rate to stay under limit
+        // Burst of 5 allows quick sequences, then we pace out
+        Arc::new(Mutex::new(RateLimiter::new(5.0, 0.9)))
+    }).clone()
+}
+
+/// Acquire a rate limit token before making a Plane.so API call.
+/// This is a convenience function that acquires from the shared limiter.
+pub async fn rate_limit() {
+    get_rate_limiter().lock().await.acquire().await;
+}
+
+/// Plane.so API client with built-in rate limiting.
 pub struct PlaneClient {
     client: reqwest::Client,
     api_url: String,
     api_key: String,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 impl PlaneClient {
-    /// Create a new Plane.so client.
+    /// Create a new Plane.so client with rate limiting.
     pub fn new() -> Result<Self> {
         let global = GlobalConfig::load()?;
         let api_key = global.plane_api_key()
@@ -23,12 +87,21 @@ impl PlaneClient {
             client: reqwest::Client::new(),
             api_url: global.plane_url(),
             api_key,
+            rate_limiter: get_rate_limiter(),
         })
+    }
+
+    /// Acquire rate limit token before making request.
+    async fn rate_limit(&self) {
+        self.rate_limiter.lock().await.acquire().await;
     }
 
     /// List active issues in a project.
     pub async fn list_active_issues(&self, config: &ProjectConfig) -> Result<Vec<PlaneIssue>> {
+        self.rate_limit().await;
         let project_id = self.resolve_project_id(&config.workspace, &config.project_slug).await?;
+
+        self.rate_limit().await;
         let url = format!(
             "{}/workspaces/{}/projects/{}/issues/",
             self.api_url, config.workspace, project_id
@@ -66,6 +139,7 @@ impl PlaneClient {
 
     /// Create an issue in Plane.so.
     pub async fn create_issue(&self, config: &ProjectConfig, task: &PendingTask) -> Result<PlaneIssue> {
+        self.rate_limit().await;
         let url = format!(
             "{}/workspaces/{}/projects/{}/issues/",
             self.api_url, config.workspace, config.project_slug
@@ -121,6 +195,7 @@ impl PlaneClient {
             return Ok(identifier.to_string());
         }
 
+        // Note: rate_limit already called by caller
         let url = format!("{}/workspaces/{}/projects/", self.api_url, workspace);
         let response = self.client
             .get(&url)
