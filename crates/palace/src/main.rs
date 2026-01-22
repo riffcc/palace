@@ -143,27 +143,11 @@ enum Commands {
         project: Option<String>,
     },
 
-    /// Run the Palace daemon with live visualization
+    /// Run the Palace daemon (listens for @palace commands via Zulip)
     Daemon {
         /// Project directory (defaults to current)
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
-
-        /// Web server port for visualization
-        #[arg(long, default_value = "3456")]
-        port: u16,
-
-        /// LM Studio URL
-        #[arg(long, default_value = "http://localhost:1234/v1")]
-        llm_url: String,
-
-        /// Model to use
-        #[arg(long, default_value = "glm-4-plus")]
-        model: String,
-
-        /// Enable run recording
-        #[arg(long)]
-        record: bool,
     },
 
     /// Manage agent sessions
@@ -620,36 +604,28 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(handle_call(&tool, input.as_deref(), &path, workspace.as_deref(), project.as_deref()))?;
         }
 
-        Commands::Daemon { path, port, llm_url, model, record } => {
+        Commands::Daemon { path } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let project_path = path.canonicalize()
                     .context("Failed to resolve project path")?;
 
-                let config = director::DaemonConfig {
-                    project_path,
-                    llm_url_override: Some(llm_url),
-                    model,
-                    web_addr: format!("127.0.0.1:{}", port).parse()
-                        .context("Invalid port")?,
-                    record,
-                    record_path: if record {
-                        Some(std::path::PathBuf::from("palace_daemon_recording.json"))
-                    } else {
-                        None
-                    },
-                    analysis_interval_secs: 30,
-                    zulip_enabled: false,
-                    zulip_stream: "palace".to_string(),
-                };
+                // Set project path for handlers
+                // SAFETY: Single-threaded at this point, before spawning reactor
+                unsafe { std::env::set_var("PALACE_PROJECT_PATH", &project_path); }
 
-                info!("Starting Palace Daemon...");
-                info!("Visualization: http://127.0.0.1:{}", port);
+                println!("🏛️  Palace Daemon starting...");
+                println!("   Project: {}", project_path.display());
 
-                let daemon = director::Daemon::new(config)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                daemon.run().await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                // Create and run the Zulip reactor
+                let mut reactor = director::ZulipReactor::from_env()
+                    .map_err(|e| anyhow::anyhow!("Failed to create Zulip reactor: {}", e))?;
+
+                println!("   Listening for @palace commands on Zulip");
+                println!("\n🟢 Ready. Ctrl+C to shutdown.\n");
+
+                reactor.run().await
+                    .map_err(|e| anyhow::anyhow!("Reactor error: {}", e))?;
 
                 Ok::<(), anyhow::Error>(())
             })?;

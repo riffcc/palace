@@ -143,6 +143,31 @@ For code generation tasks, select model tier based on edit complexity:
 * Complex (multi-file, architectural) → FULL
 * Critical (breaking changes) → FULL+OC
 
+## Palace Architecture (CRITICAL - READ THIS)
+
+### `pal daemon` = PALACE DAEMON (the worker)
+- Listens for commands via Zulip (`@palace approve 1,2,3`)
+- Maintains persistent presence
+- Maintains persistent rate limits to everything it talks to
+- Executes work when commanded
+- Uses ZulipReactor to poll for events
+
+### `pal director` = DIRECTOR BOT (the manager)
+- Controls the Palace Daemon like a human would
+- Project manager / program director
+- Gives commands TO the daemon
+- Makes decisions about what work to do
+- An LLM agent that manages projects
+
+**THEY ARE DIFFERENT THINGS.**
+- Daemon = executor, worker, listener
+- Director = brain, manager, commander
+
+The Director tells the Daemon what to do.
+The Daemon does the work.
+
+Do NOT confuse them. Do NOT merge them. Do NOT assume they're equivalent.
+
 ## Director Operating Procedures
 
 When operating as Director on this codebase, follow these procedures:
