@@ -206,5 +206,20 @@ When operating, identify by machine name, not "claude-code":
 
 **Working around broken tools is BANNED.** If a tool doesn't work, fix the tool. Don't find clever workarounds that hide the problem.
 
+### EAT YOUR OWN DOGFOOD
+
+**Use `pal call` extensively for CODE operations:**
+
+- `pal call smart_read` for reading code files (AST analysis, symbols)
+- `pal call smart_write` for editing code files (function replacement, etc.)
+- `pal call plane` for all Plane.so operations
+- `pal call zulip` for all Zulip operations
+
+If you are an AI agent working on this codebase,
+you MUST use the Palace tools for code, not bypass them.
+This validates the tools work and surfaces bugs.
+
+Note: Use normal Read/Edit for non-code files like markdown, config, etc.
+
 ## License
 Palace is licensed under the GNU Affero General Public License v3.0.

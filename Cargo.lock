@@ -1284,6 +1284,7 @@ dependencies = [
  "html-escape",
  "llm-code-sdk",
  "mountain",
+ "palace-plane",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -3680,6 +3681,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tracing",
 ]
