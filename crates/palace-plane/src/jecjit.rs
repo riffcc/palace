@@ -428,4 +428,110 @@ mod tests {
         assert!(paths_match("./src/foo.rs", "src/foo.rs"));
         assert!(paths_match("foo.rs", "src/foo.rs"));
     }
+
+    #[test]
+    fn test_extract_code_references_html() {
+        let text = "The <code>PlaneClient</code> in <code>api.rs</code> handles requests";
+        let (files, symbols) = extract_code_references(text);
+
+        assert!(files.contains(&"api.rs".to_string()));
+        assert!(symbols.contains(&"PlaneClient".to_string()));
+    }
+
+    #[test]
+    fn test_extract_code_references_multiple_files() {
+        let text = "Changes to src/lib.rs and tests/integration.rs are needed";
+        let (files, _) = extract_code_references(text);
+
+        assert!(files.contains(&"src/lib.rs".to_string()));
+        assert!(files.contains(&"tests/integration.rs".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spec_items_checklist() {
+        let content = r#"
+# Roadmap
+
+- [ ] Add authentication
+- [x] Fix login bug
+- [ ] Implement rate limiting
+"#;
+
+        let items = parse_spec_items(content, "ROADMAP.md");
+
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().any(|i| i.description == "Add authentication"));
+        assert!(items.iter().any(|i| i.description == "Implement rate limiting"));
+    }
+
+    #[test]
+    fn test_parse_spec_items_tasks() {
+        let content = r#"
+## Features
+
+- Add user profiles feature
+- Implement dark mode support
+- Just a note (not a task)
+"#;
+
+        let items = parse_spec_items(content, "FEATURES.md");
+
+        // Should pick up items that look like tasks
+        assert!(items.iter().any(|i| i.description.contains("user profiles")));
+        assert!(items.iter().any(|i| i.description.contains("dark mode")));
+    }
+
+    #[test]
+    fn test_looks_like_task() {
+        assert!(looks_like_task("Add user authentication"));
+        assert!(looks_like_task("Implement caching feature"));
+        assert!(looks_like_task("Fix the login bug"));
+        assert!(looks_like_task("Create new API endpoint"));
+        assert!(looks_like_task("Wire up the Zulip integration"));
+
+        // These shouldn't be tasks
+        assert!(!looks_like_task("This is just a note"));
+        assert!(!looks_like_task("Some random text"));
+    }
+
+    #[test]
+    fn test_has_matching_issue() {
+        let mut issues = HashMap::new();
+        issues.insert("1".to_string(), CachedIssue {
+            id: "1".to_string(),
+            sequence_id: 1,
+            name: "Add user authentication".to_string(),
+            description: None,
+            state: "Backlog".to_string(),
+            priority: "high".to_string(),
+            related_files: vec![],
+            related_symbols: vec![],
+        });
+
+        // Exact match
+        assert!(has_matching_issue("Add user authentication", &issues));
+
+        // Partial match
+        assert!(has_matching_issue("user authentication system", &issues));
+
+        // No match
+        assert!(!has_matching_issue("Implement caching", &issues));
+    }
+
+    #[test]
+    fn test_is_common_word() {
+        assert!(is_common_word("the"));
+        assert!(is_common_word("TRUE"));
+        assert!(is_common_word("None"));
+
+        assert!(!is_common_word("authenticate"));
+        assert!(!is_common_word("PlaneClient"));
+    }
+
+    #[test]
+    fn test_normalize_path() {
+        assert_eq!(normalize_path("./src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_path("/src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_path("src/main.rs"), "src/main.rs");
+    }
 }

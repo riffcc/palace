@@ -261,3 +261,111 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_html_escape() {
+        assert_eq!(html_escape("hello"), "hello");
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("foo & bar"), "foo &amp; bar");
+        assert_eq!(html_escape("say \"hi\""), "say &quot;hi&quot;");
+        assert_eq!(
+            html_escape("<a href=\"test\">link & stuff</a>"),
+            "&lt;a href=&quot;test&quot;&gt;link &amp; stuff&lt;/a&gt;"
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_burst() {
+        let mut limiter = RateLimiter::new(5.0, 1.0);
+
+        // Should have 5 tokens initially (burst capacity)
+        assert!(limiter.tokens >= 4.9);
+
+        // Consume 3 tokens synchronously (no waiting needed since we have burst)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for _ in 0..3 {
+            rt.block_on(limiter.acquire());
+        }
+
+        // Should have ~2 tokens left
+        assert!(limiter.tokens >= 1.5 && limiter.tokens <= 2.5);
+    }
+
+    #[test]
+    fn test_rate_limiter_refill() {
+        let mut limiter = RateLimiter::new(5.0, 10.0); // 10 tokens/sec for fast test
+
+        // Drain all tokens
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for _ in 0..5 {
+            rt.block_on(limiter.acquire());
+        }
+
+        // Wait a bit for refill
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Acquire should work without long wait (tokens refilled)
+        rt.block_on(limiter.acquire());
+
+        // Should have acquired successfully (test passes if no timeout)
+    }
+
+    #[test]
+    fn test_plane_issue_deserialize() {
+        let json = r#"{
+            "id": "abc-123",
+            "sequence_id": 42,
+            "name": "Fix the bug",
+            "description_html": "<p>Some description</p>",
+            "state": "In Progress",
+            "priority": "high"
+        }"#;
+
+        let issue: PlaneIssue = serde_json::from_str(json).unwrap();
+
+        assert_eq!(issue.id, "abc-123");
+        assert_eq!(issue.sequence_id, 42);
+        assert_eq!(issue.name, "Fix the bug");
+        assert_eq!(issue.state, Some("In Progress".to_string()));
+        assert_eq!(issue.priority, Some("high".to_string()));
+    }
+
+    #[test]
+    fn test_plane_issue_deserialize_minimal() {
+        // Only required fields
+        let json = r#"{
+            "id": "xyz-789",
+            "sequence_id": 1,
+            "name": "Minimal issue"
+        }"#;
+
+        let issue: PlaneIssue = serde_json::from_str(json).unwrap();
+
+        assert_eq!(issue.id, "xyz-789");
+        assert_eq!(issue.sequence_id, 1);
+        assert_eq!(issue.name, "Minimal issue");
+        assert!(issue.description_html.is_none());
+        assert!(issue.state.is_none());
+        assert!(issue.priority.is_none());
+    }
+
+    #[test]
+    fn test_plane_issues_response_deserialize() {
+        let json = r#"{
+            "results": [
+                {"id": "a", "sequence_id": 1, "name": "First"},
+                {"id": "b", "sequence_id": 2, "name": "Second"}
+            ]
+        }"#;
+
+        let response: PlaneIssuesResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].name, "First");
+        assert_eq!(response.results[1].name, "Second");
+    }
+}
