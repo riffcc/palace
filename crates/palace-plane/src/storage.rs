@@ -1,8 +1,10 @@
 //! Task storage layer for Palace.
 //!
-//! Tasks are stored in ~/.palace/projects/<project-path>/
+//! Tasks are stored in <project>/.palace/
 //! - PENDING-{id}.json - pending suggestions
 //! - APPROVED-{id}.json - approved tasks (linked to Plane.so)
+//!
+//! The .palace directory should be added to .gitignore.
 
 use crate::task::PendingTask;
 use anyhow::{Context, Result};
@@ -15,21 +17,15 @@ pub struct TaskStorage {
 
 impl TaskStorage {
     /// Create storage for a project.
+    ///
+    /// Storage is in `<project>/.palace/` - add to .gitignore.
     pub fn new(project_path: &Path) -> Result<Self> {
-        let home = dirs::home_dir().context("Could not find home directory")?;
-
         let canonical = project_path.canonicalize()
             .context("Failed to resolve project path")?;
-        let path_str = canonical.to_string_lossy();
 
-        // Use the path directly (replacing / with _) for readability
-        let safe_path = path_str
-            .trim_start_matches('/')
-            .replace('/', "_");
-
-        let storage_dir = home.join(".palace").join("projects").join(&safe_path);
+        let storage_dir = canonical.join(".palace");
         std::fs::create_dir_all(&storage_dir)
-            .context("Failed to create storage directory")?;
+            .context("Failed to create .palace directory")?;
 
         Ok(Self { storage_dir })
     }
