@@ -181,10 +181,52 @@ pub async fn generate_suggestions_with_options(
         .map(|n| format!("\n\nThe user has requested up to {} suggestions if you can find that many.", n))
         .unwrap_or_default();
 
+    // Load JECJIT context if project is configured
+    let jecjit_context = match crate::config::ProjectConfig::load(project_path) {
+        Ok(config) => {
+            let ctx = crate::jecjit::JecjitContext::new(config);
+
+            // Load specs and fetch issues (best effort)
+            ctx.load_specs(project_path);
+            let _ = ctx.refresh().await;
+
+            // Get spec gaps and all issues for context
+            let gaps = ctx.spec_gaps();
+            let all_issues = ctx.search(""); // Get all issues
+
+            let mut context = String::new();
+
+            if !all_issues.is_empty() {
+                context.push_str("\n## Existing Issues (already tracked in Plane)\n");
+                for issue in all_issues.iter().take(15) {
+                    context.push_str(&format!("- [{}] {} ({})\n", issue.id, issue.name, issue.state));
+                }
+                if all_issues.len() > 15 {
+                    context.push_str(&format!("  ... and {} more\n", all_issues.len() - 15));
+                }
+                context.push_str("\nDon't suggest work that's already tracked above.\n");
+            }
+
+            if !gaps.is_empty() {
+                context.push_str("\n## Spec Gaps (from roadmap/spec files, NOT yet tracked)\n");
+                for gap in gaps.iter().take(10) {
+                    context.push_str(&format!("- {} (from {})\n", gap.description, gap.source));
+                }
+                if gaps.len() > 10 {
+                    context.push_str(&format!("  ... and {} more\n", gaps.len() - 10));
+                }
+                context.push_str("\nConsider suggesting these gaps as high-priority work.\n");
+            }
+
+            context
+        }
+        Err(_) => String::new(),
+    };
+
     let system_prompt = format!(r#"You are a code analyst. Explore this project and suggest what to work on next.
 
 Project root: {project_root}
-
+{jecjit_context}
 ## Instructions
 
 1. Use your tools to explore the codebase:
