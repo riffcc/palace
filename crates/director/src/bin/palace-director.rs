@@ -8,7 +8,7 @@
 
 use director::{
     ControlCommand, ControlServer, Pool, TelepathyKind, Verbosity,
-    ZulipTool, ZulipAgentTool, PlaneAgentTool, parse_model,
+    ZulipTool, ZulipAgentTool, PlaneAgentTool, ZulipReactor, parse_model,
 };
 use llm_code_sdk::Client;
 use llm_code_sdk::tools::{ToolRunner, ToolRunnerConfig, ToolEvent, create_editing_tools};
@@ -303,6 +303,22 @@ async fn main() -> anyhow::Result<()> {
     let session_mgr_clone = session_mgr.clone();
     let node_name_clone = node_name.clone();
     let first_director = director_specs.first().map(|(n, _)| n.clone()).unwrap_or_default();
+
+    // Start Zulip reactor for @palace commands
+    let zulip_reactor_handle = match ZulipReactor::from_env() {
+        Ok(mut reactor) => {
+            println!("   Zulip reactor: listening for @palace commands");
+            Some(tokio::spawn(async move {
+                if let Err(e) = reactor.run().await {
+                    tracing::error!("Zulip reactor error: {}", e);
+                }
+            }))
+        }
+        Err(e) => {
+            println!("   Zulip reactor: disabled ({})", e);
+            None
+        }
+    };
 
     // Main event loop
     println!("\n🟢 Ready. Ctrl+C to shutdown.");
