@@ -512,11 +512,119 @@ impl ZulipReactor {
         );
 
         // Auto-acknowledge messages that mention us
-        if msg.content.contains("@**Director**") || msg.content.contains("@_**Director**") {
+        let mentions_palace = msg.content.contains("@**Palace**") || msg.content.contains("@_**Palace**");
+        let mentions_director = msg.content.contains("@**Director**") || msg.content.contains("@_**Director**");
+
+        if mentions_palace || mentions_director {
             self.acknowledge(msg.id).await?;
         }
 
+        // Parse @palace commands
+        if let Some((cmd, args)) = Self::parse_palace_command(&msg.content) {
+            let stream = msg.subject.as_deref().unwrap_or("palace");
+            let topic = msg.subject.as_deref().unwrap_or("general");
+
+            match cmd.as_str() {
+                "approve" => {
+                    self.handle_approve_command(msg.id, stream, topic, &args).await?;
+                }
+                "help" => {
+                    let help_text = r#"**Palace Commands:**
+- `@palace approve 1,2,3` - Create Plane issues from suggestions
+- `@palace help` - Show this help"#;
+                    self.send(stream, topic, help_text).await?;
+                    self.mark_completed(msg.id).await?;
+                }
+                _ => {
+                    tracing::debug!("Unknown palace command: {}", cmd);
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Handle @palace approve command.
+    async fn handle_approve_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+        args: &str,
+    ) -> DirectorResult<()> {
+        let indices = Self::parse_numbers(args);
+
+        if indices.is_empty() {
+            self.send(stream, topic, "No valid indices provided. Usage: `@palace approve 1,2,3`").await?;
+            self.mark_failed(message_id).await?;
+            return Ok(());
+        }
+
+        self.mark_in_progress(message_id).await?;
+
+        // Get project path from environment
+        let project_path = std::env::var("PALACE_PROJECT_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        // Call approval function
+        match palace_plane::approve_tasks(&project_path, &indices).await {
+            Ok(results) => {
+                if results.is_empty() {
+                    self.send(stream, topic, "No tasks approved (indices may not exist).").await?;
+                    self.mark_failed(message_id).await?;
+                } else {
+                    // Get project config for nice formatting
+                    let prefix = palace_plane::ProjectConfig::load(&project_path)
+                        .map(|c| c.project_slug.to_uppercase())
+                        .unwrap_or_else(|_| "PAL".to_string());
+
+                    let mut response = format!("✅ **Approved {} task(s):**\n\n", results.len());
+                    for (task, issue) in &results {
+                        response.push_str(&format!(
+                            "- [{}-{}] {}\n",
+                            prefix, issue.sequence_id, task.title
+                        ));
+                    }
+                    self.send(stream, topic, &response).await?;
+                    self.mark_completed(message_id).await?;
+                }
+            }
+            Err(e) => {
+                self.send(stream, topic, &format!("❌ **Approval failed:** {}", e)).await?;
+                self.mark_failed(message_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse a @palace command from message content.
+    /// Returns (command, args) if found.
+    pub fn parse_palace_command(content: &str) -> Option<(String, String)> {
+        // Match @**Palace** or @_**Palace** followed by command
+        let patterns = ["@**Palace**", "@_**Palace**", "@**palace**", "@_**palace**"];
+
+        for pattern in patterns {
+            if let Some(pos) = content.find(pattern) {
+                let after = &content[pos + pattern.len()..].trim();
+                // Parse command and args
+                let parts: Vec<&str> = after.splitn(2, char::is_whitespace).collect();
+                if !parts.is_empty() {
+                    let cmd = parts[0].to_lowercase();
+                    let args = parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+                    return Some((cmd, args));
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse comma-separated numbers from a string.
+    pub fn parse_numbers(s: &str) -> Vec<usize> {
+        s.split(',')
+            .filter_map(|n| n.trim().parse::<usize>().ok())
+            .collect()
     }
 
     /// Handle incoming reaction.
@@ -587,5 +695,76 @@ mod tests {
         assert!(md.contains("[x] Build Zulip integration"));
         assert!(md.contains("[ ] Test event loop 🔄"));
         assert!(md.contains("50%"));
+    }
+
+    #[test]
+    fn test_parse_palace_command_approve() {
+        let (cmd, args) = ZulipReactor::parse_palace_command("@**Palace** approve 2,4,5,6,10").unwrap();
+        assert_eq!(cmd, "approve");
+        assert_eq!(args, "2,4,5,6,10");
+    }
+
+    #[test]
+    fn test_parse_palace_command_help() {
+        let (cmd, args) = ZulipReactor::parse_palace_command("@**Palace** help").unwrap();
+        assert_eq!(cmd, "help");
+        assert_eq!(args, "");
+    }
+
+    #[test]
+    fn test_parse_palace_command_silent_mention() {
+        let (cmd, args) = ZulipReactor::parse_palace_command("@_**Palace** approve 1,2,3").unwrap();
+        assert_eq!(cmd, "approve");
+        assert_eq!(args, "1,2,3");
+    }
+
+    #[test]
+    fn test_parse_palace_command_lowercase() {
+        let (cmd, args) = ZulipReactor::parse_palace_command("@**palace** approve 5").unwrap();
+        assert_eq!(cmd, "approve");
+        assert_eq!(args, "5");
+    }
+
+    #[test]
+    fn test_parse_palace_command_in_sentence() {
+        let (cmd, args) = ZulipReactor::parse_palace_command("Hey @**Palace** approve 1,2 please").unwrap();
+        assert_eq!(cmd, "approve");
+        assert_eq!(args, "1,2 please");
+    }
+
+    #[test]
+    fn test_parse_palace_command_no_match() {
+        assert!(ZulipReactor::parse_palace_command("Hello world").is_none());
+        assert!(ZulipReactor::parse_palace_command("@Director help").is_none());
+    }
+
+    #[test]
+    fn test_parse_numbers_simple() {
+        let nums = ZulipReactor::parse_numbers("1,2,3");
+        assert_eq!(nums, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_numbers_with_spaces() {
+        let nums = ZulipReactor::parse_numbers("1, 2, 3, 4");
+        assert_eq!(nums, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_parse_numbers_mixed() {
+        let nums = ZulipReactor::parse_numbers("2,4,5,6,10");
+        assert_eq!(nums, vec![2, 4, 5, 6, 10]);
+    }
+
+    #[test]
+    fn test_parse_numbers_invalid() {
+        let nums = ZulipReactor::parse_numbers("a,b,c");
+        assert!(nums.is_empty());
+    }
+
+    #[test]
+    fn test_parse_numbers_partial_invalid() {
+        let nums = ZulipReactor::parse_numbers("1,foo,3,bar,5");
+        assert_eq!(nums, vec![1, 3, 5]);
     }
 }
