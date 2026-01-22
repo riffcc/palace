@@ -33,9 +33,9 @@ use tracing::info;
 #[command(about = "AI-assisted software development with gamepad control")]
 #[command(version)]
 struct Cli {
-    /// LM Studio endpoint URL
-    #[arg(long, default_value = "http://localhost:1234/v1")]
-    lm_studio: String,
+    /// LM Studio endpoint URL (uses Z.ai API if not provided)
+    #[arg(long)]
+    lm_studio: Option<String>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -292,7 +292,12 @@ enum SessionCommands {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Load .env file
+    // Load .env from ~/.palace/.env first, then current directory
+    if let Ok(home) = std::env::var("HOME") {
+        let palace_env = std::path::PathBuf::from(home).join(".palace").join(".env");
+        dotenvy::from_path(palace_env).ok();
+    }
+    // Current directory .env can override
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
@@ -314,11 +319,13 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Play { rom, bios, turbo } => {
-            app::run_play(rom, bios, turbo, &cli.lm_studio)?;
+            let lm_url = cli.lm_studio.as_deref().unwrap_or("http://localhost:1234/v1");
+            app::run_play(rom, bios, turbo, lm_url)?;
         }
 
         Commands::Project { path, name } => {
-            app::run_project(path, name, &cli.lm_studio)?;
+            let lm_url = cli.lm_studio.as_deref().unwrap_or("http://localhost:1234/v1");
+            app::run_project(path, name, lm_url)?;
         }
 
         Commands::Gamepads => {
@@ -327,7 +334,8 @@ fn main() -> anyhow::Result<()> {
 
         Commands::TestLlm { prompt } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(inference::test_connection(&cli.lm_studio, &prompt))?;
+            let lm_url = cli.lm_studio.as_deref().unwrap_or("http://localhost:1234/v1");
+            rt.block_on(inference::test_connection(lm_url, &prompt))?;
         }
 
         Commands::Next { path } => {
@@ -365,7 +373,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 "suggest" => {
-                                    println!("\x1b[90m💡 Generating suggestions...\x1b[0m");
+                                    println!("\x1b[90m💡 Generating suggestions\x1b[0m");
                                 }
                                 _ => {}
                             }
@@ -375,21 +383,143 @@ fn main() -> anyhow::Result<()> {
                 })
             };
 
-            let tasks = rt.block_on(palace_plane::generate_next_with_callback(
+            let tasks = rt.block_on(palace_plane::generate_next_with_options(
                 &path,
-                &cli.lm_studio,
                 Some(callback),
+                None, // request_up_to - let model decide
+                cli.lm_studio.as_deref(),
             ))?;
 
             println!();
             if tasks.is_empty() {
                 println!("No suggestions generated.");
             } else {
-                for (_id, task) in &tasks {
-                    println!("○ {}", task.title);
+                // Show raw suggestions first
+                for stored in &tasks {
+                    println!("{}. {}", stored.index, stored.task.title);
                 }
-                println!();
-                println!("\x1b[90mUse 'palace ls' to see pending tasks, 'palace approve <n>' to create issues.\x1b[0m");
+
+                // Stream = project name, topic = "suggestions"
+                let project_config = palace_plane::ProjectConfig::load(&path).ok();
+                let zulip_stream = project_config.as_ref()
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| {
+                        path.canonicalize()
+                            .ok()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                            .unwrap_or_else(|| "palace".to_string())
+                    });
+                let zulip_topic = "suggestions";
+
+                // Connect to Zulip if configured (Palace bot)
+                let zulip_tool = match director::ZulipTool::from_env_palace() {
+                    Ok(tool) => {
+                        // Ensure stream exists before sending
+                        if let Err(e) = rt.block_on(tool.ensure_stream(&zulip_stream)) {
+                            eprintln!("\x1b[33mFailed to create Zulip stream: {}\x1b[0m", e);
+                        }
+                        Some(tool)
+                    }
+                    Err(_) => {
+                        eprintln!("\x1b[33mZulip not configured. Set PALACE_BOT_EMAIL and PALACE_API_KEY to stream suggestions.\x1b[0m");
+                        None
+                    }
+                };
+
+                // Progressive enhancement phase
+                println!("\n\x1b[33m🔮 Enhancing suggestions with plans and relations...\x1b[0m\n");
+
+                // Channel for sending enhanced tasks to Zulip
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, palace_plane::PendingTask)>(16);
+
+                // Spawn Zulip sender task
+                let zulip_handle = if let Some(tool) = zulip_tool {
+                    let stream_clone = zulip_stream.clone();
+                    let topic_clone = zulip_topic.clone();
+                    Some(rt.spawn(async move {
+                        while let Some((index, task)) = rx.recv().await {
+                            let content = format_suggestion_markdown(index, &task);
+                            if let Err(e) = tool.send(&stream_clone, &topic_clone, &content).await {
+                                eprintln!("\x1b[33m⚠️  Failed to send to Zulip: {}\x1b[0m", e);
+                            }
+                        }
+                    }))
+                } else {
+                    // Drain channel if no Zulip
+                    rt.spawn(async move { while rx.recv().await.is_some() {} });
+                    None
+                };
+
+                // Enhancement callback that prints and sends to channel
+                let tx_clone = tx.clone();
+                let enhancement_callback = {
+                    std::sync::Arc::new(move |index: usize, task: &palace_plane::PendingTask| {
+                        // Print to terminal
+                        println!("\x1b[36m━━━ #{} {} ━━━\x1b[0m", index, task.title);
+
+                        if let Some(plan) = &task.plan {
+                            println!("\x1b[90mPlan:\x1b[0m");
+                            for (i, step) in plan.iter().enumerate() {
+                                println!("  {}. {}", i + 1, step);
+                            }
+                        }
+
+                        if let Some(subtasks) = &task.subtasks {
+                            if !subtasks.is_empty() {
+                                println!("\x1b[90mSubtasks:\x1b[0m");
+                                for st in subtasks {
+                                    println!("  • {}", st);
+                                }
+                            }
+                        }
+
+                        if let Some(relations) = &task.relations {
+                            if !relations.is_empty() {
+                                println!("\x1b[90mRelations:\x1b[0m");
+                                for rel in relations {
+                                    let rel_type = match rel.relation_type {
+                                        palace_plane::RelationType::DependsOn => "depends on",
+                                        palace_plane::RelationType::Blocks => "blocks",
+                                        palace_plane::RelationType::RelatedTo => "related to",
+                                    };
+                                    let reason = rel.reason.as_deref().unwrap_or("");
+                                    println!("  → {} #{}{}", rel_type, rel.target_index,
+                                        if reason.is_empty() { String::new() } else { format!(" ({})", reason) });
+                                }
+                            }
+                        }
+                        println!();
+
+                        // Send to Zulip channel (non-blocking)
+                        let _ = tx_clone.try_send((index, task.clone()));
+                    })
+                };
+
+                let lm_url = cli.lm_studio.clone();
+                rt.block_on(palace_plane::enhance_all_suggestions(
+                    &path,
+                    Some(enhancement_callback),
+                    lm_url.as_deref(),
+                ))?;
+
+                // Drop sender to signal completion
+                drop(tx);
+
+                // Wait for Zulip sender to finish
+                if let Some(handle) = zulip_handle {
+                    rt.block_on(handle)?;
+                    // Send summary message
+                    if let Ok(tool) = director::ZulipTool::from_env() {
+                        let summary = format!(
+                            "**{} suggestions ready for review**\n\n\
+                            Use `@palace approve 1,2,3` to approve suggestions and create Plane issues.",
+                            tasks.len()
+                        );
+                        rt.block_on(tool.send(&zulip_stream, &zulip_topic, &summary)).ok();
+                    }
+                }
+
+                println!("\x1b[90mUse 'pal approve <n>' to create issues, 'pal rm <n>' to remove.\x1b[0m");
             }
         }
 
@@ -410,36 +540,36 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                let tasks = palace_plane::list_pending(&path)?;
+                let suggestions = palace_plane::load_suggestions(&path)?;
 
-                if tasks.is_empty() {
-                    println!("No pending tasks. Run 'palace next' to generate suggestions.");
+                if suggestions.is_empty() {
+                    println!("No pending suggestions. Run 'pal next' to generate some.");
                 } else {
-                    println!("Pending tasks ({}):\n", tasks.len());
-                    for (i, (id, task)) in tasks.iter().enumerate() {
-                        println!("  {}. [PENDING-{}] {}", i + 1, id, task.title);
-                        if let Some(desc) = &task.description {
+                    println!();
+                    for s in &suggestions {
+                        println!("{}. {}", s.index, s.task.title);
+                        if let Some(desc) = &s.task.description {
                             if let Some(first_line) = desc.lines().next() {
-                                println!("     {}", first_line);
+                                println!("   \x1b[90m{}\x1b[0m", first_line);
                             }
                         }
                     }
-                    println!("\nUse 'palace approve <numbers>' to create Plane.so issues.");
-                    println!("Use 'palace rm <numbers>' to remove tasks.");
+                    println!();
+                    println!("\x1b[90mUse 'pal approve <n>' to create issues, 'pal rm <n>' to remove.\x1b[0m");
                 }
             }
         }
 
         Commands::Rm { numbers, path } => {
             let indices = parse_numbers(&numbers)?;
-            let removed = palace_plane::remove_pending(&path, &indices)?;
+            let removed = palace_plane::remove_suggestions(&path, &indices)?;
 
             if removed.is_empty() {
-                println!("No tasks removed.");
+                println!("No suggestions removed.");
             } else {
-                println!("Removed {} task(s):", removed.len());
-                for (id, task) in &removed {
-                    println!("  [PENDING-{}] {}", id, task.title);
+                println!("Removed {} suggestion(s):", removed.len());
+                for s in &removed {
+                    println!("  {}. {}", s.index, s.task.title);
                 }
             }
         }
@@ -1138,19 +1268,11 @@ fn parse_priority(s: Option<&str>) -> palace_plane::TaskPriority {
 }
 
 /// Get existing config or auto-initialize.
-fn get_or_init_config(
+async fn get_or_init_config(
     project_path: &std::path::Path,
-    workspace: Option<&str>,
-    project: Option<&str>,
 ) -> anyhow::Result<palace_plane::ProjectConfig> {
-    match palace_plane::ProjectConfig::load(project_path) {
-        Ok(config) => Ok(config),
-        Err(_) => {
-            // Auto-init
-            info!("Auto-initializing Palace for project...");
-            palace_plane::init_project(project_path, workspace, project)
-        }
-    }
+    let result = palace_plane::smart_init_project(project_path).await?;
+    Ok(result.config)
 }
 
 /// Unified Plane.so API handler - systemd style.
@@ -1168,6 +1290,10 @@ async fn handle_plane(
 
     let client = reqwest::Client::new();
 
+    // Shared rate limiter for Plane.so API (60 req/min limit)
+    // Use rate_limiter.lock().await.acquire().await before each HTTP request
+    let rate_limiter = palace_plane::get_rate_limiter();
+
     // Helper to get project ID (UUID) from identifier
     async fn get_project_id(
         client: &reqwest::Client,
@@ -1176,6 +1302,7 @@ async fn handle_plane(
         workspace: &str,
         project: &str,
     ) -> anyhow::Result<String> {
+        palace_plane::rate_limit().await;
         let url = format!("{}/workspaces/{}/projects/", api_url, workspace);
         let resp: serde_json::Value = client.get(&url)
             .header("X-API-Key", api_key)
@@ -1195,9 +1322,87 @@ async fn handle_plane(
         anyhow::bail!("Project '{}' not found in workspace '{}'", project, workspace)
     }
 
+    // Helper to resolve issue ID (sequence like "51" or "PAL-51") to UUID
+    async fn resolve_issue_id(
+        client: &reqwest::Client,
+        api_url: &str,
+        api_key: &str,
+        workspace: &str,
+        project_id: &str,
+        issue_id: &str,
+    ) -> anyhow::Result<String> {
+        // If it looks like a UUID already, return it
+        if issue_id.len() == 36 && issue_id.contains('-') {
+            return Ok(issue_id.to_string());
+        }
+
+        // Extract sequence number (handle "PAL-51" or just "51")
+        let sequence: u64 = if issue_id.contains('-') {
+            issue_id.split('-').last()
+                .and_then(|s| s.parse().ok())
+                .context("Invalid issue ID format")?
+        } else {
+            issue_id.parse().context("Invalid issue ID")?
+        };
+
+        // Fetch issues and find by sequence
+        palace_plane::rate_limit().await;
+        let url = format!("{}/workspaces/{}/projects/{}/issues/", api_url, workspace, project_id);
+        let resp: serde_json::Value = client.get(&url)
+            .header("X-API-Key", api_key)
+            .send().await?
+            .json().await?;
+
+        let issues = resp["results"].as_array()
+            .context("Invalid issues response")?;
+
+        for i in issues {
+            if i["sequence_id"].as_u64() == Some(sequence) {
+                return Ok(i["id"].as_str().unwrap().to_string());
+            }
+        }
+        anyhow::bail!("Issue {} not found", issue_id)
+    }
+
+    // Helper to resolve state name to UUID
+    async fn resolve_state_id(
+        client: &reqwest::Client,
+        api_url: &str,
+        api_key: &str,
+        workspace: &str,
+        project_id: &str,
+        state_name: &str,
+    ) -> anyhow::Result<String> {
+        // If it looks like a UUID already, return it
+        if state_name.len() == 36 && state_name.contains('-') {
+            return Ok(state_name.to_string());
+        }
+
+        palace_plane::rate_limit().await;
+        let url = format!("{}/workspaces/{}/projects/{}/states/", api_url, workspace, project_id);
+        let resp: serde_json::Value = client.get(&url)
+            .header("X-API-Key", api_key)
+            .send().await?
+            .json().await?;
+
+        let states = resp["results"].as_array()
+            .context("Invalid states response")?;
+
+        let state_lower = state_name.to_lowercase();
+        for s in states {
+            let name = s["name"].as_str().unwrap_or("");
+            if name.to_lowercase() == state_lower ||
+               name.to_lowercase().contains(&state_lower) {
+                return Ok(s["id"].as_str().unwrap().to_string());
+            }
+        }
+        anyhow::bail!("State '{}' not found", state_name)
+    }
+
     match (verb, object_type) {
         // === PROJECTS ===
         ("list", "project" | "projects") => {
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/", api_url, workspace);
             let resp: serde_json::Value = client.get(&url)
                 .header("X-API-Key", &api_key)
@@ -1213,6 +1418,36 @@ async fn handle_plane(
             }
         }
 
+        ("create", "project" | "projects") => {
+            let name = params.get("name").and_then(|v| v.as_str())
+                .context("name required")?;
+            let identifier = params.get("identifier").and_then(|v| v.as_str())
+                .context("identifier required (e.g., AST)")?;
+
+            let mut body = serde_json::json!({
+                "name": name,
+                "identifier": identifier,
+                "network": 2  // 2 = private (default)
+            });
+
+            // Optional description
+            if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+                body["description"] = serde_json::json!(desc);
+            }
+
+            rate_limiter.lock().await.acquire().await;
+            let url = format!("{}/workspaces/{}/projects/", api_url, workspace);
+            let resp: serde_json::Value = client.post(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?.json().await?;
+
+            println!("Created project: {} ({}) -> {}",
+                resp["identifier"].as_str().unwrap_or("?"),
+                resp["name"].as_str().unwrap_or("?"),
+                resp["id"].as_str().unwrap_or("?"));
+        }
+
         // === ISSUES ===
         ("list", "issue" | "issues") => {
             let project = params.get("project").and_then(|v| v.as_str())
@@ -1220,6 +1455,7 @@ async fn handle_plane(
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
             // First get states for this project
+            rate_limiter.lock().await.acquire().await;
             let states_url = format!("{}/workspaces/{}/projects/{}/states/",
                 api_url, workspace, project_id);
             let states_resp: serde_json::Value = client.get(&states_url)
@@ -1232,6 +1468,7 @@ async fn handle_plane(
                     .collect())
                 .unwrap_or_default();
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1260,6 +1497,7 @@ async fn handle_plane(
                 .context("id required (issue UUID or sequence like PAL-123)")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
                 api_url, workspace, project_id, issue_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1292,6 +1530,7 @@ async fn handle_plane(
                 body["state"] = serde_json::json!(state);
             }
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.post(&url)
@@ -1308,27 +1547,66 @@ async fn handle_plane(
         ("update", "issue" | "issues") => {
             let project = params.get("project").and_then(|v| v.as_str())
                 .context("project required")?;
-            let issue_id = params.get("id").and_then(|v| v.as_str())
-                .context("id required")?;
+            let issue_id_input = params.get("id").and_then(|v| v.as_str())
+                .context("id required (e.g., PAL-51 or 51)")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            // Resolve sequence ID to UUID if needed
+            let issue_uuid = resolve_issue_id(&client, &api_url, &api_key, workspace, &project_id, issue_id_input).await?;
+
+            // Extract cycle if present - handled via separate endpoint
+            let cycle_id = params.get("cycle").and_then(|v| v.as_str()).map(|s| s.to_string());
 
             let mut body = serde_json::Map::new();
             for (k, v) in params {
-                if !["project", "id", "workspace", "verb", "type"].contains(&k.as_str()) {
-                    body.insert(k.clone(), v.clone());
+                // Skip meta fields and cycle (handled separately)
+                if ["project", "id", "workspace", "verb", "type", "cycle"].contains(&k.as_str()) {
+                    continue;
+                }
+                // Handle state specially - resolve state name to UUID
+                if k == "state" {
+                    if let Some(state_name) = v.as_str() {
+                        if let Ok(state_id) = resolve_state_id(&client, &api_url, &api_key, workspace, &project_id, state_name).await {
+                            body.insert(k.clone(), serde_json::json!(state_id));
+                            continue;
+                        }
+                    }
+                }
+                body.insert(k.clone(), v.clone());
+            }
+
+            // Update issue fields if any (besides cycle)
+            if !body.is_empty() {
+                rate_limiter.lock().await.acquire().await;
+                let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
+                    api_url, workspace, project_id, issue_uuid);
+                let _resp: serde_json::Value = client.patch(&url)
+                    .header("X-API-Key", &api_key)
+                    .json(&body)
+                    .send().await?.json().await?;
+            }
+
+            // Add to cycle via separate endpoint if cycle specified
+            if let Some(cycle) = cycle_id {
+                rate_limiter.lock().await.acquire().await;
+                let cycle_url = format!("{}/workspaces/{}/projects/{}/cycles/{}/cycle-issues/",
+                    api_url, workspace, project_id, cycle);
+                let cycle_body = serde_json::json!({
+                    "issues": [issue_uuid]
+                });
+                let cycle_resp = client.post(&cycle_url)
+                    .header("X-API-Key", &api_key)
+                    .json(&cycle_body)
+                    .send().await?;
+
+                if !cycle_resp.status().is_success() {
+                    let status = cycle_resp.status();
+                    let text = cycle_resp.text().await.unwrap_or_default();
+                    eprintln!("Warning: Failed to add to cycle: {} - {}", status, text);
                 }
             }
 
-            let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
-                api_url, workspace, project_id, issue_id);
-            let resp: serde_json::Value = client.patch(&url)
-                .header("X-API-Key", &api_key)
-                .json(&body)
-                .send().await?.json().await?;
-
-            println!("Updated: {}-{}",
-                project.to_uppercase(),
-                resp["sequence_id"].as_u64().unwrap_or(0));
+            println!("Updated: {}-{}", project.to_uppercase(), issue_id_input);
         }
 
         ("delete", "issue" | "issues") => {
@@ -1338,6 +1616,7 @@ async fn handle_plane(
                 .context("id required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
                 api_url, workspace, project_id, issue_id);
             client.delete(&url)
@@ -1353,6 +1632,7 @@ async fn handle_plane(
                 .context("project required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/cycles/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1377,20 +1657,80 @@ async fn handle_plane(
                 .context("name required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "name": name,
-                "start_date": params.get("start_date").and_then(|v| v.as_str()),
-                "end_date": params.get("end_date").and_then(|v| v.as_str())
+                "project_id": project_id
             });
+            if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+                body["description"] = serde_json::json!(desc);
+            }
+            if let Some(start) = params.get("start_date").and_then(|v| v.as_str()) {
+                body["start_date"] = serde_json::json!(start);
+            }
+            if let Some(end) = params.get("end_date").and_then(|v| v.as_str()) {
+                body["end_date"] = serde_json::json!(end);
+            }
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/cycles/",
                 api_url, workspace, project_id);
-            let resp: serde_json::Value = client.post(&url)
+            let resp = client.post(&url)
+                .header("X-API-Key", &api_key)
+                .json(&body)
+                .send().await?;
+
+            let status = resp.status();
+            let resp_json: serde_json::Value = resp.json().await?;
+
+            if !status.is_success() {
+                anyhow::bail!("Failed to create cycle: {}", resp_json);
+            }
+
+            println!("Created cycle: {} ({})",
+                resp_json["name"].as_str().unwrap_or("?"),
+                resp_json["id"].as_str().unwrap_or("?"));
+        }
+
+        ("update", "cycle" | "cycles") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let cycle_id = params.get("id").and_then(|v| v.as_str())
+                .context("id required (cycle UUID)")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            let mut body = serde_json::Map::new();
+            for (k, v) in params {
+                if !["project", "id", "workspace", "verb", "type"].contains(&k.as_str()) {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
+
+            rate_limiter.lock().await.acquire().await;
+            let url = format!("{}/workspaces/{}/projects/{}/cycles/{}/",
+                api_url, workspace, project_id, cycle_id);
+            let resp: serde_json::Value = client.patch(&url)
                 .header("X-API-Key", &api_key)
                 .json(&body)
                 .send().await?.json().await?;
 
-            println!("Created cycle: {}", resp["name"].as_str().unwrap_or("?"));
+            println!("Updated cycle: {}", resp["name"].as_str().unwrap_or("?"));
+        }
+
+        ("delete", "cycle" | "cycles") => {
+            let project = params.get("project").and_then(|v| v.as_str())
+                .context("project required")?;
+            let cycle_id = params.get("id").and_then(|v| v.as_str())
+                .context("id required (cycle UUID)")?;
+            let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+
+            rate_limiter.lock().await.acquire().await;
+            let url = format!("{}/workspaces/{}/projects/{}/cycles/{}/",
+                api_url, workspace, project_id, cycle_id);
+            client.delete(&url)
+                .header("X-API-Key", &api_key)
+                .send().await?;
+
+            println!("Deleted cycle: {}", cycle_id);
         }
 
         // === MODULES ===
@@ -1399,6 +1739,7 @@ async fn handle_plane(
                 .context("project required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/modules/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1423,6 +1764,7 @@ async fn handle_plane(
 
             let body = serde_json::json!({"name": name});
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/modules/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.post(&url)
@@ -1439,6 +1781,7 @@ async fn handle_plane(
                 .context("project required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/labels/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1461,6 +1804,7 @@ async fn handle_plane(
                 .context("project required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
 
+            rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/states/",
                 api_url, workspace, project_id);
             let resp: serde_json::Value = client.get(&url)
@@ -1489,6 +1833,7 @@ async fn handle_plane(
                 format!("{}/workspaces/{}/members/", api_url, workspace)
             };
 
+            rate_limiter.lock().await.acquire().await;
             let resp: serde_json::Value = client.get(&url)
                 .header("X-API-Key", &api_key)
                 .send().await?.json().await?;
@@ -1528,6 +1873,7 @@ async fn handle_plane(
                 let resolved_id = if issue_id.chars().all(|c| c.is_ascii_digit()) {
                     // It's a sequence number, look it up
                     let seq: u64 = issue_id.parse()?;
+                    rate_limiter.lock().await.acquire().await;
                     let list_url = format!("{}/workspaces/{}/projects/{}/issues/",
                         api_url, workspace, project_id);
                     let list_resp: serde_json::Value = client.get(&list_url)
@@ -1552,6 +1898,7 @@ async fn handle_plane(
                     }
                 }
 
+                rate_limiter.lock().await.acquire().await;
                 let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
                     api_url, workspace, project_id, resolved_id);
                 let _resp: serde_json::Value = client.patch(&url)
@@ -1725,6 +2072,66 @@ async fn handle_plane(
     }
 
     Ok(())
+}
+
+/// Format a suggestion as Zulip markdown.
+fn format_suggestion_markdown(index: usize, task: &palace_plane::PendingTask) -> String {
+    let mut content = format!("## #{} {}\n\n", index, task.title);
+
+    if let Some(desc) = &task.description {
+        content.push_str(desc);
+        content.push_str("\n\n");
+    }
+
+    if let Some(plan) = &task.plan {
+        content.push_str("**Plan:**\n");
+        for (i, step) in plan.iter().enumerate() {
+            content.push_str(&format!("{}. {}\n", i + 1, step));
+        }
+        content.push('\n');
+    }
+
+    if let Some(subtasks) = &task.subtasks {
+        if !subtasks.is_empty() {
+            content.push_str("**Subtasks:**\n");
+            for st in subtasks {
+                content.push_str(&format!("- {}\n", st));
+            }
+            content.push('\n');
+        }
+    }
+
+    if let Some(relations) = &task.relations {
+        if !relations.is_empty() {
+            content.push_str("**Relations:**\n");
+            for rel in relations {
+                let rel_type = match rel.relation_type {
+                    palace_plane::RelationType::DependsOn => "depends on",
+                    palace_plane::RelationType::Blocks => "blocks",
+                    palace_plane::RelationType::RelatedTo => "related to",
+                };
+                let reason = rel.reason.as_deref()
+                    .map(|r| format!(" *({})*", r))
+                    .unwrap_or_default();
+                content.push_str(&format!("- {} #{}{}\n", rel_type, rel.target_index, reason));
+            }
+            content.push('\n');
+        }
+    }
+
+    // Add effort/priority if present
+    let mut meta = Vec::new();
+    if let Some(effort) = &task.effort {
+        meta.push(format!("Effort: {}", effort));
+    }
+    if task.priority != palace_plane::TaskPriority::None {
+        meta.push(format!("Priority: {}", task.priority.as_str()));
+    }
+    if !meta.is_empty() {
+        content.push_str(&format!("*{}*\n", meta.join(" | ")));
+    }
+
+    content
 }
 
 /// Parse comma-separated numbers.
