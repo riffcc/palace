@@ -99,7 +99,6 @@ Types: `project`, `issue`, `cycle`, `module`, `label`, `state`, `member`
 | SmartWriteTool | llm-code-sdk | `src/tools/smart/smart_write.rs` |
 | SearchTool | llm-code-sdk | `src/tools/search.rs` |
 | ZulipTool | director | `src/zulip_tool.rs` |
-| SuggestTool | palace-plane | `src/exploration.rs` |
 
 ## Adding New Tools
 

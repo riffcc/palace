@@ -36,7 +36,7 @@ director/src/               # Director-specific functionality
 
 palace-plane/src/           # Plane.so integration
 ├── api.rs                  # PlaneClient - raw API access
-└── exploration.rs          # SuggestTool
+└── exploration.rs          # Exploration tools (read, list, glob, grep)
 ```
 
 ### Available Tools via `pal call`
