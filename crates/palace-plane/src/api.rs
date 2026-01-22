@@ -140,9 +140,12 @@ impl PlaneClient {
     /// Create an issue in Plane.so.
     pub async fn create_issue(&self, config: &ProjectConfig, task: &PendingTask) -> Result<PlaneIssue> {
         self.rate_limit().await;
+        let project_id = self.resolve_project_id(&config.workspace, &config.project_slug).await?;
+
+        self.rate_limit().await;
         let url = format!(
             "{}/workspaces/{}/projects/{}/issues/",
-            self.api_url, config.workspace, config.project_slug
+            self.api_url, config.workspace, project_id
         );
 
         let description = task.description.as_ref().map(|d| {
