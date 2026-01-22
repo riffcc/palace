@@ -150,6 +150,10 @@ pub struct GlobalConfig {
     /// Plane.so API URL.
     #[serde(default = "default_plane_url")]
     pub plane_api_url: String,
+
+    /// Folders to scan for projects (looks for .palace/project.yml inside subdirs).
+    #[serde(default)]
+    pub project_folders: Vec<String>,
 }
 
 fn default_plane_url() -> String {
@@ -162,6 +166,7 @@ impl Default for GlobalConfig {
             plane_default_workspace: None,
             plane_api_key: None,
             plane_api_url: default_plane_url(),
+            project_folders: Vec::new(),
         }
     }
 }
@@ -206,6 +211,37 @@ impl GlobalConfig {
     pub fn plane_url(&self) -> String {
         std::env::var("PLANE_API_URL")
             .unwrap_or_else(|_| self.plane_api_url.clone())
+    }
+
+    /// Discover all projects by scanning configured folders.
+    /// Returns map of stream name -> project path.
+    pub fn discover_projects(&self) -> std::collections::HashMap<String, std::path::PathBuf> {
+        let mut lookup = std::collections::HashMap::new();
+
+        for folder in &self.project_folders {
+            let folder_path = std::path::PathBuf::from(folder);
+            if let Ok(entries) = std::fs::read_dir(&folder_path) {
+                for entry in entries.flatten() {
+                    let project_path = entry.path();
+                    if project_path.is_dir() {
+                        // Check if this dir has .palace/project.yml
+                        if let Ok(config) = ProjectConfig::load(&project_path) {
+                            // Use the name field as stream name, fall back to project_slug
+                            let stream_name = config.name
+                                .unwrap_or_else(|| config.project_slug.clone());
+                            lookup.insert(stream_name, project_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        lookup
+    }
+
+    /// Find project path by stream name.
+    pub fn find_project_by_stream(&self, stream: &str) -> Option<std::path::PathBuf> {
+        self.discover_projects().get(stream).cloned()
     }
 }
 

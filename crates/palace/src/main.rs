@@ -144,11 +144,8 @@ enum Commands {
     },
 
     /// Run the Palace daemon (listens for @palace commands via Zulip)
-    Daemon {
-        /// Project directory (defaults to current)
-        #[arg(short, long, default_value = ".")]
-        path: PathBuf,
-    },
+    /// One daemon handles unlimited projects - project context from Zulip stream/topic.
+    Daemon,
 
     /// Manage agent sessions
     #[command(subcommand)]
@@ -604,18 +601,12 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(handle_call(&tool, input.as_deref(), &path, workspace.as_deref(), project.as_deref()))?;
         }
 
-        Commands::Daemon { path } => {
+        Commands::Daemon => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let project_path = path.canonicalize()
-                    .context("Failed to resolve project path")?;
-
-                // Set project path for handlers
-                // SAFETY: Single-threaded at this point, before spawning reactor
-                unsafe { std::env::set_var("PALACE_PROJECT_PATH", &project_path); }
-
                 println!("🏛️  Palace Daemon starting...");
-                println!("   Project: {}", project_path.display());
+                println!("   One daemon, unlimited projects");
+                println!("   Project context from Zulip stream/topic");
 
                 // Create and run the Zulip reactor
                 let mut reactor = director::ZulipReactor::from_env()

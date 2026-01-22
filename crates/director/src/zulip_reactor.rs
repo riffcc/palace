@@ -562,10 +562,16 @@ impl ZulipReactor {
 
         self.mark_in_progress(message_id).await?;
 
-        // Get project path from environment
-        let project_path = std::env::var("PALACE_PROJECT_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // Find project path from stream name
+        let global_config = palace_plane::GlobalConfig::load()
+            .unwrap_or_default();
+        let project_path = global_config.find_project_by_stream(stream)
+            .unwrap_or_else(|| {
+                // Fall back to env var or current dir
+                std::env::var("PALACE_PROJECT_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
 
         // Call approval function
         match palace_plane::approve_tasks(&project_path, &indices).await {

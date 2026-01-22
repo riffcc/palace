@@ -146,7 +146,9 @@ For code generation tasks, select model tier based on edit complexity:
 ## Palace Architecture (CRITICAL - READ THIS)
 
 ### `pal daemon` = PALACE DAEMON (the worker)
+- ONE daemon for UNLIMITED projects
 - Listens for commands via Zulip (`@palace approve 1,2,3`)
+- Project context comes from Zulip stream/topic
 - Maintains persistent presence
 - Maintains persistent rate limits to everything it talks to
 - Executes work when commanded
