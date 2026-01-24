@@ -858,16 +858,19 @@ impl ZulipReactor {
 
                 tokio::spawn(async move {
                     let mut executor = SessionExecutor::new(config, manager_clone);
+                    tracing::info!("Executor created for session {}, starting execution...", session_id);
                     if let Err(e) = executor.execute(session_id).await {
                         tracing::error!("Session {} failed: {}", session_id, e);
-                        // Try to report failure
-                        if let Ok(tool) = ZulipTool::from_env() {
+                        // Try to report failure using Palace bot credentials
+                        if let Ok(tool) = ZulipTool::from_env_palace() {
                             let _ = tool.send(
                                 &stream_clone,
                                 &format!("palace/{}", session_name_clone),
                                 &format!("❌ Session failed: {}", e)
                             ).await;
                         }
+                    } else {
+                        tracing::info!("Session {} completed successfully", session_id);
                     }
                 });
 
