@@ -48,11 +48,14 @@ mod error;
 mod executor;
 mod goals;
 mod issues;
+mod model_ladder;
+mod multi_model;
 mod orchestrator;
 mod planner;
 mod project;
 mod session;
 mod session_executor;
+mod skill_finder;
 mod state;
 mod zulip_reactor;
 mod zulip_reporter;
@@ -78,6 +81,9 @@ pub use session::{
     Handoff, HandoffKind,
 };
 pub use session_executor::{SessionExecutor, SessionExecutorConfig};
+pub use skill_finder::{SkillFinder, SkillRegistry, SkillEntry, SkillContext};
+pub use model_ladder::{ModelLadder, ModelTier, ModelEndpoint, ComplexitySignals, UpgradeRequest};
+pub use multi_model::{MultiModelEdit, Placeholder, PlaceholderScan};
 pub use state::{DirectorState, ProjectMetrics};
 pub use zulip_reactor::{ZulipReactor, ZulipEvent, MessageEvent, ReactionEvent, ChannelStatus, TodoItem, emoji};
 pub use zulip_reporter::{ZulipReporter, SurveyOption, TodoTask, MessageSlot};
