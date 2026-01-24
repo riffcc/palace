@@ -389,6 +389,15 @@ pub struct Session {
     pub error: Option<String>,
     /// Process ID if running in background.
     pub pid: Option<u32>,
+    /// Skills to apply to this session (paths or names).
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Recording enabled for this session.
+    #[serde(default)]
+    pub recording: bool,
+    /// Path to the session transcript file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -415,7 +424,22 @@ impl Session {
             current_task: None,
             error: None,
             pid: None,
+            skills: Vec::new(),
+            recording: true, // Enable recording by default
+            transcript_path: None,
         }
+    }
+
+    /// Create a session with skills.
+    pub fn with_skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// Enable or disable recording.
+    pub fn with_recording(mut self, recording: bool) -> Self {
+        self.recording = recording;
+        self
     }
 
     /// Mark the session as running.
@@ -523,7 +547,24 @@ impl SessionManager {
         target: SessionTarget,
         strategy: SessionStrategy,
     ) -> DirectorResult<Session> {
-        let session = Session::new(target, strategy, self.project_path.clone());
+        self.create_session_with_skills(target, strategy, Vec::new()).await
+    }
+
+    /// Create a new session with skills.
+    pub async fn create_session_with_skills(
+        &self,
+        target: SessionTarget,
+        strategy: SessionStrategy,
+        skills: Vec<String>,
+    ) -> DirectorResult<Session> {
+        let session = Session::new(target, strategy, self.project_path.clone())
+            .with_skills(skills);
+
+        // Set up transcript path for recording
+        let transcript_dir = self.project_path.join(".palace/transcripts");
+        std::fs::create_dir_all(&transcript_dir).ok();
+        let mut session = session;
+        session.transcript_path = Some(transcript_dir.join(format!("{}.jsonl", session.short_id())));
 
         // ALWAYS set up git worktree for sandboxing - all sessions are isolated
         let session = self.setup_worktree(session).await?;

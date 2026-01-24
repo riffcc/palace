@@ -2,12 +2,22 @@
 //!
 //! This module contains the logic that actually executes sessions,
 //! spawning LLM agents to work on issues, modules, or cycles.
+//!
+//! ## Skills Support
+//!
+//! Sessions can have skills applied that specialize the agent:
+//! - Base skills (coding best practices)
+//! - Language skills (TypeScript, Rust, Vue.js)
+//! - Project skills (Riff.CC, Flagship conventions)
+//!
+//! Skills are stacked in order (base → specialized).
 
 use crate::{
     DirectorError, DirectorResult, Executor, ExecutorConfig,
     Session, SessionManager, SessionStatus, SessionStrategy, SessionTarget, SingleTarget,
     LogLevel, ZulipReporter,
 };
+use llm_code_sdk::skills::{LocalSkill, SkillStack};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -50,6 +60,7 @@ pub struct SessionExecutor {
     config: SessionExecutorConfig,
     manager: Arc<SessionManager>,
     zulip: Option<ZulipReporter>,
+    skill_stack: SkillStack,
 }
 
 impl SessionExecutor {
@@ -63,7 +74,12 @@ impl SessionExecutor {
             None
         };
 
-        Self { config, manager, zulip }
+        Self {
+            config,
+            manager,
+            zulip,
+            skill_stack: SkillStack::new(),
+        }
     }
 
     /// Enable Zulip reporting with a custom reporter.
@@ -72,12 +88,84 @@ impl SessionExecutor {
         self
     }
 
+    /// Load skills for a session.
+    fn load_skills(&mut self, session: &Session) {
+        self.skill_stack = SkillStack::new();
+
+        for skill_path in &session.skills {
+            // Try to load as a file path first
+            let path = PathBuf::from(skill_path);
+            if path.exists() {
+                if let Err(e) = self.skill_stack.load(&path) {
+                    tracing::warn!("Failed to load skill from {}: {}", skill_path, e);
+                } else {
+                    tracing::info!("Loaded skill from {}", skill_path);
+                }
+            } else {
+                // Try to load from standard locations
+                let locations = [
+                    session.project_path.join(".palace/skills").join(format!("{}.md", skill_path)),
+                    session.project_path.join(".claude/commands").join(format!("{}.md", skill_path)),
+                    PathBuf::from(format!("{}/.claude/commands/{}.md", std::env::var("HOME").unwrap_or_default(), skill_path)),
+                ];
+
+                let mut found = false;
+                for loc in &locations {
+                    if loc.exists() {
+                        if let Err(e) = self.skill_stack.load(loc) {
+                            tracing::warn!("Failed to load skill from {:?}: {}", loc, e);
+                        } else {
+                            tracing::info!("Loaded skill '{}' from {:?}", skill_path, loc);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !found {
+                    // Create inline skill from name
+                    tracing::info!("Creating inline skill reference: {}", skill_path);
+                    self.skill_stack.push(LocalSkill::from_content(
+                        skill_path,
+                        format!("Apply {} specialist knowledge.", skill_path),
+                    ));
+                }
+            }
+        }
+
+        if !self.skill_stack.is_empty() {
+            tracing::info!("Loaded {} skills for session", self.skill_stack.len());
+        }
+    }
+
+    /// Get the skill system prompt.
+    fn skill_system_prompt(&self) -> Option<String> {
+        if self.skill_stack.is_empty() {
+            None
+        } else {
+            Some(self.skill_stack.to_system_prompt())
+        }
+    }
+
     /// Execute a session.
     pub async fn execute(&mut self, session_id: Uuid) -> DirectorResult<()> {
         let session = self.manager.get_session(session_id).await
             .ok_or_else(|| DirectorError::Other(format!("Session not found: {}", session_id)))?;
 
         tracing::info!("Starting session execution: {} ({})", session.name, session.short_id());
+
+        // Load skills for this session
+        self.load_skills(&session);
+        if !self.skill_stack.is_empty() {
+            self.manager.log(
+                session_id,
+                LogLevel::Info,
+                &format!("Loaded {} skills: {:?}",
+                    self.skill_stack.len(),
+                    self.skill_stack.skills().iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            ).await;
+        }
 
         // Update status to running
         self.manager.update_status(session_id, SessionStatus::Running).await;
@@ -290,9 +378,14 @@ impl SessionExecutor {
         }
 
         // Create a task description for the executor
+        let skill_context = self.skill_system_prompt()
+            .map(|s| format!("{}\n\n---\n\n", s))
+            .unwrap_or_default();
+
         let task = format!(
-            "Complete the following issue:\n\nTitle: {}\n\nDescription:\n{}\n\n\
+            "{}Complete the following issue:\n\nTitle: {}\n\nDescription:\n{}\n\n\
             Work in the current directory. Make necessary code changes, run tests, and ensure the task is complete.",
+            skill_context,
             issue_details.name,
             issue_details.description.unwrap_or_default()
         );
