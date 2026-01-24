@@ -194,24 +194,54 @@ pub struct ZulipReactor {
 }
 
 impl ZulipReactor {
-    /// Create from environment.
+    /// Create from environment using Palace bot credentials.
+    /// Use this for the Palace daemon that handles @palace commands.
     pub fn from_env() -> DirectorResult<Self> {
+        Self::from_env_palace()
+    }
+
+    /// Create from Palace bot credentials.
+    pub fn from_env_palace() -> DirectorResult<Self> {
         let _ = dotenvy::dotenv();
+        let creds = palace_plane::Credentials::load()
+            .map_err(|e| DirectorError::Config(e.to_string()))?;
 
-        let server_url = std::env::var("ZULIP_SERVER_URL")
-            .unwrap_or_else(|_| "https://localhost:8443".to_string());
+        let server_url = creds.zulip_server_url()
+            .ok_or_else(|| DirectorError::Config("Zulip server URL not set".into()))?;
 
-        let email = std::env::var("DIRECTOR_BOT_EMAIL")
-            .or_else(|_| std::env::var("ZULIP_BOT_EMAIL"))
-            .map_err(|_| DirectorError::Config("Bot email not set".into()))?;
+        let email = creds.palace_bot_email()
+            .ok_or_else(|| DirectorError::Config("Palace bot email not set".into()))?;
 
-        let api_key = std::env::var("DIRECTOR_API_KEY")
-            .or_else(|_| std::env::var("ZULIP_API_KEY"))
-            .map_err(|_| DirectorError::Config("API key not set".into()))?;
+        let api_key = creds.palace_api_key()
+            .ok_or_else(|| DirectorError::Config("Palace API key not set".into()))?;
 
-        let insecure = std::env::var("ZULIP_INSECURE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        let insecure = creds.zulip_insecure();
+
+        Self::new_internal(server_url, email, api_key, insecure)
+    }
+
+    /// Create from Director bot credentials.
+    /// Use this for the Director that manages projects.
+    pub fn from_env_director() -> DirectorResult<Self> {
+        let _ = dotenvy::dotenv();
+        let creds = palace_plane::Credentials::load()
+            .map_err(|e| DirectorError::Config(e.to_string()))?;
+
+        let server_url = creds.zulip_server_url()
+            .ok_or_else(|| DirectorError::Config("Zulip server URL not set".into()))?;
+
+        let email = creds.director_bot_email()
+            .ok_or_else(|| DirectorError::Config("Director bot email not set".into()))?;
+
+        let api_key = creds.director_api_key()
+            .ok_or_else(|| DirectorError::Config("Director API key not set".into()))?;
+
+        let insecure = creds.zulip_insecure();
+
+        Self::new_internal(server_url, email, api_key, insecure)
+    }
+
+    fn new_internal(server_url: String, email: String, api_key: String, insecure: bool) -> DirectorResult<Self> {
 
         let client = if insecure {
             Client::builder()
@@ -391,10 +421,34 @@ impl ZulipReactor {
         Ok(())
     }
 
-    /// Send a message.
+    /// Send a message using the reactor's credentials.
     pub async fn send(&self, stream: &str, topic: &str, content: &str) -> DirectorResult<u64> {
-        let tool = ZulipTool::from_env()?;
-        tool.send(stream, topic, content).await
+        let url = format!("{}/api/v1/messages", self.server_url);
+
+        let resp = self.client
+            .post(&url)
+            .basic_auth(&self.email, Some(&self.api_key))
+            .form(&[
+                ("type", "stream"),
+                ("to", stream),
+                ("topic", topic),
+                ("content", content),
+            ])
+            .send()
+            .await
+            .map_err(|e| DirectorError::Zulip(e.to_string()))?;
+
+        let body: serde_json::Value = resp.json().await
+            .map_err(|e| DirectorError::Zulip(e.to_string()))?;
+
+        if body["result"].as_str() != Some("success") {
+            return Err(DirectorError::Zulip(
+                body["msg"].as_str().unwrap_or("Send failed").to_string()
+            ));
+        }
+
+        body["id"].as_u64()
+            .ok_or_else(|| DirectorError::Zulip("No message ID in response".to_string()))
     }
 
     /// Update the pinned status message for a channel.
@@ -577,9 +631,9 @@ impl ZulipReactor {
                 "approve" => {
                     self.handle_approve_command(msg.id, &stream, topic, &args).await?;
                 }
-                "work" | "new" => {
-                    // @palace work PAL-85 or @palace new PAL-85
-                    self.handle_work_command(msg.id, &stream, topic, &args).await?;
+                "new" => {
+                    // @palace new PAL-85 - spawn a session for an issue
+                    self.handle_new_command(msg.id, &stream, topic, &args).await?;
                 }
                 "session" => {
                     // @palace session <subcommand>
@@ -607,8 +661,8 @@ impl ZulipReactor {
                 }
                 "help" => {
                     let help_text = r#"**Palace Commands:**
-- `@palace work <issue>` - Spawn a coding session for an issue
-- `@palace session new <issue>` - Same as work
+- `@palace new <issue>` - Spawn a coding session for an issue
+- `@palace session new <issue>` - Same as new
 - `@palace session ls` - List all sessions
 - `@palace ls` - Short for session ls
 - `@palace switch <name>` - Switch active session
@@ -735,8 +789,8 @@ impl ZulipReactor {
         Ok(())
     }
 
-    /// Handle @palace work <issue> command - spawn a coding session.
-    async fn handle_work_command(
+    /// Handle @palace new <issue> command - spawn a coding session.
+    async fn handle_new_command(
         &self,
         message_id: u64,
         stream: &str,
@@ -745,7 +799,7 @@ impl ZulipReactor {
     ) -> DirectorResult<()> {
         let issue_id = args.trim();
         if issue_id.is_empty() {
-            self.send(stream, topic, "Usage: `@palace work PAL-85` or `@palace work 85`").await?;
+            self.send(stream, topic, "Usage: `@palace new PAL-85` or `@palace new 85`").await?;
             self.mark_failed(message_id).await?;
             return Ok(());
         }
@@ -753,10 +807,13 @@ impl ZulipReactor {
         self.mark_in_progress(message_id).await?;
 
         let project_path = self.get_project_path(stream);
+        tracing::info!("Creating session for {} in project {:?}", issue_id, project_path);
+
         let manager = self.get_session_manager(&project_path).await;
 
         // Create session for this issue
         let target = SessionTarget::issue(issue_id);
+        tracing::info!("Target: {:?}, creating session...", target);
         match manager.create_session(target.clone(), SessionStrategy::Simple).await {
             Ok(session) => {
                 let session_id = session.id;
@@ -840,7 +897,7 @@ impl ZulipReactor {
         match subcmd.as_str() {
             "new" | "create" => {
                 // @palace session new PAL-85
-                self.handle_work_command(message_id, stream, topic, subargs).await
+                self.handle_new_command(message_id, stream, topic, subargs).await
             }
             "ls" | "list" => {
                 // @palace session ls
@@ -1115,7 +1172,7 @@ impl ZulipReactor {
         )).await?;
 
         // Now spawn a work session for this issue
-        self.handle_work_command(message_id, stream, topic, &issue_id).await
+        self.handle_new_command(message_id, stream, topic, &issue_id).await
     }
 
     /// Parse a @palace command from message content.
