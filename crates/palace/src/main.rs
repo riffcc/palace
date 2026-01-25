@@ -820,6 +820,7 @@ async fn handle_session_command(cmd: SessionCommands) -> anyhow::Result<()> {
                     project: "PAL".to_string(),
                     zulip_enabled: false,
                     zulip_stream: "palace".to_string(),
+                    skills: vec![],
                 };
 
                 let mut executor = director::SessionExecutor::new(exec_config, manager.clone());
@@ -920,6 +921,7 @@ async fn handle_session_command(cmd: SessionCommands) -> anyhow::Result<()> {
                 project: "PAL".to_string(),
                 zulip_enabled: false,
                 zulip_stream: "palace".to_string(),
+                skills: vec![],
             };
 
             // Create and run executor
