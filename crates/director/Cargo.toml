@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Plane.so and Zulip integration
 reqwest.workspace = true
 tempfile.workspace = true
+redb.workspace = true
 
 [[bin]]
 name = "palace-director"

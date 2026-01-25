@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Model capability tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
+    #[default]
     /// Ultra-fast local 8B model for quick decisions.
     Fast,
     /// Fast local flash model.

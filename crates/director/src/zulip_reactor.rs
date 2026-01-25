@@ -25,6 +25,7 @@
 
 use crate::zulip_tool::ZulipTool;
 use crate::{DirectorError, DirectorResult, SessionManager, SessionTarget, SessionStrategy, SessionExecutor, SessionExecutorConfig};
+use crate::skill_finder::{SkillFinder, SkillContext};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
