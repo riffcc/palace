@@ -2,7 +2,9 @@ use director::ZulipTool;
 use std::sync::{Arc, Mutex};
 
 /// Test the EXACT flow that pal next uses
+/// Requires PALACE_ZULIP_* env vars to be set
 #[tokio::test]
+#[ignore = "requires Zulip credentials"]
 async fn test_pal_next_zulip_flow() {
     // This is what pal next does
     let tool = ZulipTool::from_env_palace().expect("from_env_palace failed");
@@ -33,6 +35,7 @@ async fn test_pal_next_zulip_flow() {
 }
 
 #[tokio::test]
+#[ignore = "requires Zulip credentials"]
 async fn test_zulip_from_env_palace() {
     let result = ZulipTool::from_env_palace();
     match &result {
@@ -43,6 +46,7 @@ async fn test_zulip_from_env_palace() {
 }
 
 #[tokio::test]
+#[ignore = "requires Zulip credentials"]
 async fn test_zulip_send() {
     let tool = ZulipTool::from_env_palace().expect("Failed to create ZulipTool");
     let result = tool.send("palace", "test", "Test message from cargo test").await;
@@ -54,6 +58,7 @@ async fn test_zulip_send() {
 }
 
 #[tokio::test]
+#[ignore = "requires Zulip credentials"]
 async fn test_zulip_send_and_update() {
     let tool = ZulipTool::from_env_palace().expect("Failed to create ZulipTool");
 
@@ -108,7 +113,9 @@ async fn test_zulip_send_and_update() {
 }
 
 /// Test the streaming pattern used by `pal next` - rapid fire updates from callback
+/// Requires PALACE_ZULIP_* env vars to be set
 #[tokio::test]
+#[ignore = "requires Zulip credentials"]
 async fn test_zulip_streaming_pattern() {
     let tool = ZulipTool::from_env_palace().expect("Failed to create ZulipTool");
     let timestamp = std::time::SystemTime::now()

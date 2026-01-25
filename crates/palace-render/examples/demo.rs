@@ -18,7 +18,20 @@
 //! cargo run -p palace-render --example demo
 //! ```
 
-use mountain::benchmarks::pokebench::{GbaButton, GbaEmulator, PokeBenchConfig};
+// Mock GBA types for demo (real emulator requires ROM files)
+#[derive(Debug, Clone, Copy)]
+enum GbaButton {
+    A, B, Start, Select, Up, Down, Left, Right,
+}
+
+struct GbaEmulator;
+
+impl GbaEmulator {
+    fn new() -> Self { Self }
+    fn run_frame(&mut self) -> Result<(), ()> { Ok(()) }
+    fn press_button(&mut self, _button: GbaButton) {}
+    fn release_button(&mut self, _button: GbaButton) {}
+}
 use palace_render::{DualScreen, FrameBuffer, PalaceRenderer, RenderConfig, UIState};
 use std::time::{Duration, Instant};
 use winit::{
@@ -61,9 +74,8 @@ struct DemoApp {
 
 impl DemoApp {
     fn new() -> Self {
-        // Create mock GBA emulator
-        let config = PokeBenchConfig::default();
-        let emulator = GbaEmulator::new(&config).expect("Failed to create emulator");
+        // Create mock GBA emulator (no ROM needed for demo)
+        let emulator = GbaEmulator::new();
 
         Self {
             window: None,

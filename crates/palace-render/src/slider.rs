@@ -146,8 +146,8 @@ mod tests {
         let widget = ConfidenceSliderWidget::new();
         let display = widget.get_display();
 
-        // Default is MediumAssurance
-        assert_eq!(display.current, "MED+");
+        // Default is Flash
+        assert_eq!(display.current, "FLASH");
         assert!(display.previous.is_some());
         assert!(display.next.is_some());
     }

@@ -124,9 +124,56 @@ Commit (atomic apply when passing)
 | `palace-render` | wgpu dual-screen rendering |
 | `palace-ci` | Dagger CI pipelines |
 
+## Prerequisites
+
+### System Dependencies (Ubuntu/Debian)
+
+```bash
+# Required for gamepad support and audio
+sudo apt-get install -y libudev-dev libasound2-dev
+```
+
+### Git Submodules and External Dependencies
+
+Palace uses `llm-code-sdk` as a submodule and requires two additional repos
+to be cloned alongside it:
+
+```bash
+# Clone Palace and initialize submodules
+git clone https://github.com/rifflabs/palace.git
+cd palace
+git submodule update --init --recursive
+
+# Clone required external dependencies (at the same level as palace/)
+cd ..
+git clone https://github.com/rifflabs/minirust-search.git
+git clone https://github.com/rifflabs/tree-sitter-nim.git tree-sitter-nim-fork
+cd palace
+```
+
+Your directory structure should look like:
+```
+parent/
+├── palace/
+├── minirust-search/
+└── tree-sitter-nim-fork/
+```
+
+### Rust
+
+Requires Rust 1.75+ (for async trait support).
+
+```bash
+# Install via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
 ## Quick Start
 
 ```bash
+# Build
+cargo build
+
 # Install
 cargo install --path crates/palace
 
