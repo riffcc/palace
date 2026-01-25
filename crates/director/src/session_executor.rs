@@ -39,6 +39,8 @@ pub struct SessionExecutorConfig {
     pub zulip_enabled: bool,
     /// Zulip stream to report to.
     pub zulip_stream: String,
+    /// Skills to load for this session (auto-detected or manual).
+    pub skills: Vec<String>,
 }
 
 impl Default for SessionExecutorConfig {
@@ -51,6 +53,7 @@ impl Default for SessionExecutorConfig {
             project: "PAL".to_string(),
             zulip_enabled: false,
             zulip_stream: "palace".to_string(),
+            skills: Vec::new(),
         }
     }
 }
@@ -89,10 +92,19 @@ impl SessionExecutor {
     }
 
     /// Load skills for a session.
+    /// Merges session skills with config skills (config skills take precedence).
     fn load_skills(&mut self, session: &Session) {
         self.skill_stack = SkillStack::new();
 
-        for skill_path in &session.skills {
+        // Collect all skills (session + config, deduped)
+        let mut all_skills: Vec<String> = session.skills.clone();
+        for skill in &self.config.skills {
+            if !all_skills.contains(skill) {
+                all_skills.push(skill.clone());
+            }
+        }
+
+        for skill_path in &all_skills {
             // Try to load as a file path first
             let path = PathBuf::from(skill_path);
             if path.exists() {

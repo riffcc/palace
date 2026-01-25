@@ -729,6 +729,42 @@ impl ZulipReactor {
         body["stream"]["name"].as_str().map(String::from)
     }
 
+    /// Get issue description from Plane for skill matching.
+    async fn get_issue_description(&self, stream: &str, issue_id: &str) -> Option<String> {
+        let project_path = self.get_project_path(stream);
+        let config = palace_plane::ProjectConfig::load(&project_path).ok()?;
+        let client = palace_plane::PlaneClient::new().ok()?;
+
+        // Parse issue ID (handle both "PAL-85" and "85" formats)
+        let seq_id: u32 = issue_id
+            .split('-')
+            .last()
+            .and_then(|s| s.parse().ok())?;
+
+        // Fetch all active issues and find by sequence
+        match client.list_active_issues(&config).await {
+            Ok(issues) => {
+                // Find the issue by sequence ID
+                let issue = issues.iter().find(|i| i.sequence_id == seq_id)?;
+
+                // Combine name and description for context
+                let mut desc = issue.name.clone();
+                if let Some(d) = &issue.description_html {
+                    // Strip HTML tags for cleaner skill matching
+                    let stripped = d.replace("<p>", "").replace("</p>", " ")
+                        .replace("<br>", " ").replace("<br/>", " ");
+                    desc.push_str(": ");
+                    desc.push_str(&stripped);
+                }
+                Some(desc)
+            }
+            Err(e) => {
+                tracing::debug!("Could not fetch issues for {}: {}", issue_id, e);
+                None
+            }
+        }
+    }
+
     /// Handle @palace approve command.
     async fn handle_approve_command(
         &self,
@@ -810,6 +846,21 @@ impl ZulipReactor {
         let project_path = self.get_project_path(stream);
         tracing::info!("Creating session for {} in project {:?}", issue_id, project_path);
 
+        // Auto-detect skills from project context
+        let skill_finder = SkillFinder::new();
+        let mut skill_context = SkillContext::from_project(&project_path);
+
+        // Try to get issue description from Plane for better skill matching
+        let issue_description = self.get_issue_description(stream, issue_id).await;
+        if let Some(desc) = &issue_description {
+            skill_context = skill_context.with_task(desc);
+        } else {
+            skill_context = skill_context.with_task(&format!("Work on issue {}", issue_id));
+        }
+
+        let detected_skills = skill_finder.find(&skill_context).await;
+        tracing::info!("Auto-detected skills for session: {:?}", detected_skills);
+
         let manager = self.get_session_manager(&project_path).await;
 
         // Create session for this issue
@@ -823,15 +874,24 @@ impl ZulipReactor {
                 // Set as active session for this stream
                 self.set_active_session(stream, Some(session_id)).await;
 
+                // Format skills for display
+                let skills_display = if detected_skills.is_empty() {
+                    "none (generic)".to_string()
+                } else {
+                    detected_skills.join(", ")
+                };
+
                 // Report session created
                 let response = format!(
                     "🚀 **Session started:** `{}` (id: `{}`)\n\n\
                     Working on: `{}`\n\
+                    Skills: {}\n\
                     Strategy: simple\n\n\
                     Use `@palace watch {}` to follow progress.",
                     session_name,
                     session.short_id(),
                     issue_id,
+                    skills_display,
                     session.short_id()
                 );
                 self.send(stream, topic, &response).await?;
@@ -851,6 +911,7 @@ impl ZulipReactor {
                         .unwrap_or_else(|_| "PAL".to_string()),
                     zulip_enabled: true,
                     zulip_stream: stream.to_string(),
+                    skills: detected_skills.clone(),
                 };
 
                 let manager_clone = manager.clone();
