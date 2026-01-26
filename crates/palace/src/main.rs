@@ -1573,10 +1573,19 @@ async fn handle_plane(
                 rate_limiter.lock().await.acquire().await;
                 let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
                     api_url, workspace, project_id, issue_uuid);
-                let _resp: serde_json::Value = client.patch(&url)
+                let resp = client.patch(&url)
                     .header("X-API-Key", &api_key)
                     .json(&body)
-                    .send().await?.json().await?;
+                    .send().await?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Failed to update issue: {} - {}", status, text);
+                }
+            } else if cycle_id.is_none() {
+                // No fields to update and no cycle - this is a no-op, warn
+                eprintln!("Warning: No fields to update");
             }
 
             // Add to cycle via separate endpoint if cycle specified
@@ -1599,7 +1608,13 @@ async fn handle_plane(
                 }
             }
 
-            println!("Updated: {}-{}", project.to_uppercase(), issue_id_input);
+            // Normalize issue ID for display (strip project prefix if present)
+            let display_id = if issue_id_input.to_uppercase().starts_with(&format!("{}-", project.to_uppercase())) {
+                &issue_id_input[project.len() + 1..]
+            } else {
+                issue_id_input
+            };
+            println!("Updated: {}-{}", project.to_uppercase(), display_id);
         }
 
         ("delete", "issue" | "issues") => {
