@@ -776,6 +776,27 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Remove a session completely.
+    pub async fn remove_session(&self, session_id: Uuid) -> DirectorResult<()> {
+        // First cancel it (cleans up worktree)
+        self.cancel_session(session_id).await?;
+
+        // Then remove from sessions map
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(&session_id);
+        }
+
+        // Remove logs too
+        {
+            let mut logs = self.logs.write().await;
+            logs.remove(&session_id);
+        }
+
+        let _ = self.save_state().await;
+        Ok(())
+    }
+
     /// Save session state to disk.
     async fn save_state(&self) -> DirectorResult<()> {
         let sessions = self.sessions.read().await;

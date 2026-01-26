@@ -15,11 +15,13 @@
 use crate::{
     DirectorError, DirectorResult, Executor, ExecutorConfig,
     Session, SessionManager, SessionStatus, SessionStrategy, SessionTarget, SingleTarget,
-    LogLevel, ZulipReporter,
+    LogLevel, ZulipReporter, ZulipTool,
 };
 use llm_code_sdk::skills::{LocalSkill, SkillStack};
+use llm_code_sdk::tools::{ToolEvent, ToolEventCallback};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Configuration for session execution.
@@ -381,11 +383,10 @@ impl SessionExecutor {
 
         // Report to Zulip
         if let Some(ref mut zulip) = self.zulip {
-            let _ = zulip.tool_call(
+            let _ = zulip.message(
                 session_id,
                 session_name,
-                "fetch_issue",
-                &format!("Fetched issue details for `{}`", issue_id),
+                &format!("📋 **{}**\n\n{}", issue_details.name, issue_details.description.as_deref().unwrap_or("_No description_")),
             ).await;
         }
 
@@ -404,13 +405,47 @@ impl SessionExecutor {
 
         self.manager.update_progress(session_id, 0, 1, &format!("Executing {}", issue_id)).await;
 
-        // Report progress to Zulip
-        if let Some(ref mut zulip) = self.zulip {
-            let _ = zulip.session_progress(session_id, session_name, 0, 1, &format!("Executing {}", issue_id)).await;
-        }
+        // Create channel for tool events → Zulip streaming
+        let (tx, mut rx) = mpsc::unbounded_channel::<ToolEvent>();
 
-        // Run the executor
-        let result = executor.run_task(&task).await;
+        // Spawn task to forward events to Zulip
+        let stream = self.config.zulip_stream.clone();
+        let topic = session_name.replace(":", "/");
+        tokio::spawn(async move {
+            let zulip = match ZulipTool::from_env_palace() {
+                Ok(z) => z,
+                Err(e) => {
+                    tracing::warn!("Failed to create Zulip tool for streaming: {}", e);
+                    return;
+                }
+            };
+
+            while let Some(event) = rx.recv().await {
+                let msg = match event {
+                    ToolEvent::ToolCall { name, input } => {
+                        // Compact format: 🔧 Tool: key params
+                        let params = format_tool_params(&name, &input);
+                        format!("🔧 {}: {}", name, params)
+                    }
+                    ToolEvent::ToolResult { name, success, output } => {
+                        let icon = if success { "✓" } else { "✗" };
+                        format!("{} {}\n```\n{}\n```", icon, name, output)
+                    }
+                };
+
+                if let Err(e) = zulip.send(&stream, &topic, &msg).await {
+                    tracing::warn!("Failed to send tool event to Zulip: {}", e);
+                }
+            }
+        });
+
+        // Create callback that sends to channel
+        let callback: ToolEventCallback = Arc::new(move |event| {
+            let _ = tx.send(event);
+        });
+
+        // Run the executor with callback
+        let result = executor.run_task_with_callback(&task, callback).await;
 
         match result {
             Ok(output) => {
@@ -420,9 +455,8 @@ impl SessionExecutor {
                 // Report completion to Zulip
                 if let Some(ref mut zulip) = self.zulip {
                     let _ = zulip.message(session_id, session_name, &format!(
-                        "✅ Issue `{}` completed\n\n{}",
-                        issue_id,
-                        if output.len() > 200 { format!("{}...", &output[..200]) } else { output }
+                        "✅ **Completed**\n\n{}",
+                        output
                     )).await;
                 }
                 Ok(())
@@ -435,7 +469,7 @@ impl SessionExecutor {
                     let _ = zulip.blocker(
                         session_id,
                         session_name,
-                        &format!("Issue `{}` execution failed: {}", issue_id, e),
+                        &format!("Execution failed: {}", e),
                         &["Retry with different approach", "Skip this issue", "Pause session for manual intervention"],
                     ).await;
                 }
@@ -564,8 +598,9 @@ impl SessionExecutor {
 
         let project_id = projects_resp["results"].as_array()
             .and_then(|arr| arr.iter().find(|p| {
-                p["identifier"].as_str() == Some(&self.config.project) ||
-                p["name"].as_str().map(|n| n.to_lowercase()) == Some(self.config.project.to_lowercase())
+                // Case-insensitive comparison for both identifier and name
+                p["identifier"].as_str().map(|i| i.eq_ignore_ascii_case(&self.config.project)).unwrap_or(false) ||
+                p["name"].as_str().map(|n| n.eq_ignore_ascii_case(&self.config.project)).unwrap_or(false)
             }))
             .and_then(|p| p["id"].as_str())
             .ok_or_else(|| DirectorError::PlaneApi(format!("Project {} not found", self.config.project)))?;
@@ -615,4 +650,39 @@ struct IssueInfo {
     sequence_id: u32,
     name: String,
     description: Option<String>,
+}
+
+/// Format tool params in a compact human-readable way.
+fn format_tool_params(tool_name: &str, input: &std::collections::HashMap<String, serde_json::Value>) -> String {
+    // Extract the most relevant param for each tool type
+    match tool_name {
+        "list_directory" | "read_file" | "write_file" | "glob" => {
+            input.get("path").and_then(|v| v.as_str()).unwrap_or(".").to_string()
+        }
+        "grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("`{}` in {}", pattern, path)
+        }
+        "edit_file" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{}", path)
+        }
+        "bash" => {
+            input.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+        _ => {
+            // Fallback: show all params compactly
+            input.iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    format!("{}={}", k, val)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
 }

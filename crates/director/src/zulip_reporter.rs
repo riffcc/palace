@@ -105,8 +105,9 @@ impl ZulipReporter {
     }
 
     /// Get the topic for a session.
-    fn session_topic(&self, session_id: Uuid, session_name: &str) -> String {
-        format!("{}/{}: {}", self.session_prefix, &session_id.to_string()[..8], session_name)
+    fn session_topic(&self, _session_id: Uuid, session_name: &str) -> String {
+        // Topic is just the session name: issue/PAL-88, module/FOO, etc.
+        session_name.replace(":", "/")
     }
 
     /// Report session started (Status slot - persists).

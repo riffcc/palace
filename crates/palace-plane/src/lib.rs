@@ -20,7 +20,7 @@ pub use api::{PlaneClient, rate_limit, get_rate_limiter};
 pub use config::{Credentials, GlobalConfig, ProjectConfig};
 pub use jecjit::{IssueContext, JecjitContext};
 pub use storage::TaskStorage;
-pub use suggestions::{StoredSuggestion, append_suggestions, load_suggestions, remove_suggestions};
+pub use suggestions::{StoredSuggestion, append_suggestions, load_suggestions, remove_suggestions, append_blocklist, load_blocklist, is_blocked};
 pub use task::{ExplorationEvent, PendingTask, TaskPriority, TaskRelation, RelationType, EnhancementCallback, enhance_suggestion, enhance_all_suggestions};
 pub use velocity::{IssueType, VelocityTracker};
 
@@ -279,8 +279,8 @@ Return {"match": "SLUG"} to use an existing project, or {"name": "Project Name",
 /// Generate suggestions for what to do next.
 ///
 /// Uses Z.ai API with glm-4.7 by default (requires ZAI_API_KEY env var).
-pub async fn generate_next(project_path: &Path) -> Result<Vec<StoredSuggestion>> {
-    generate_next_with_options(project_path, None, None, None).await
+pub async fn generate_suggestions(project_path: &Path) -> Result<Vec<StoredSuggestion>> {
+    generate_suggestions_with_options(project_path, None, None, None).await
 }
 
 /// Generate suggestions with optional callback, request count, and endpoint override.
@@ -288,7 +288,7 @@ pub async fn generate_next(project_path: &Path) -> Result<Vec<StoredSuggestion>>
 /// - `on_event`: Optional callback for exploration events
 /// - `request_up_to`: Optional guidance for how many tasks needed (not a constraint)
 /// - `lm_studio_url`: Optional LM Studio URL (uses Z.ai API if None)
-pub async fn generate_next_with_options(
+pub async fn generate_suggestions_with_options(
     project_path: &Path,
     on_event: Option<ToolEventCallback>,
     request_up_to: Option<usize>,

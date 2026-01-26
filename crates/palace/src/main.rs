@@ -422,7 +422,7 @@ fn main() -> anyhow::Result<()> {
                 })
             };
 
-            let tasks = rt.block_on(palace_plane::generate_next_with_options(
+            let tasks = rt.block_on(palace_plane::generate_suggestions_with_options(
                 &path,
                 Some(callback),
                 None, // request_up_to - let model decide

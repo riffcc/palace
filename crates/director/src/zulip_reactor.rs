@@ -24,7 +24,7 @@
 //! contains the current todo list and metadata, edited in real-time.
 
 use crate::zulip_tool::ZulipTool;
-use crate::{DirectorError, DirectorResult, SessionManager, SessionTarget, SessionStrategy, SessionExecutor, SessionExecutorConfig};
+use crate::{DirectorError, DirectorResult, SessionManager, SessionStatus, SessionTarget, SessionStrategy, SessionExecutor, SessionExecutorConfig};
 use crate::skill_finder::{SkillFinder, SkillContext};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -35,22 +35,23 @@ use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 /// Emoji constants for reaction protocol.
+/// Using standard Unicode emoji names that work on Zulip Cloud.
 pub mod emoji {
     pub const ACKNOWLEDGED: &str = "eyes";           // 👀
-    pub const IN_PROGRESS: &str = "arrows_counterclockwise"; // 🔄
-    pub const COMPLETED: &str = "white_check_mark"; // ✅
-    pub const FAILED: &str = "x";                   // ❌
-    pub const BLOCKED: &str = "construction";       // 🚧
-    pub const REPLIED: &str = "speech_balloon";     // 💬
-    pub const PAUSED: &str = "pause_button";        // ⏸️
-    pub const RESUMED: &str = "arrow_forward";      // ▶️
-    pub const GOAL_SET: &str = "dart";              // 🎯
-    pub const TODO_UPDATED: &str = "clipboard";     // 📋
-    pub const THINKING: &str = "thought_balloon";   // 💭
-    pub const HEART: &str = "heart";                // ❤️
-    pub const THUMBS_UP: &str = "+1";               // 👍
-    pub const THUMBS_DOWN: &str = "-1";             // 👎
-    pub const STOP: &str = "stop_sign";             // 🛑
+    pub const IN_PROGRESS: &str = "gear";            // ⚙️
+    pub const COMPLETED: &str = "check";             // ✓
+    pub const FAILED: &str = "x";                    // ❌
+    pub const BLOCKED: &str = "construction";        // 🚧
+    pub const REPLIED: &str = "speech_balloon";      // 💬
+    pub const PAUSED: &str = "pause_button";         // ⏸️
+    pub const RESUMED: &str = "arrow_forward";       // ▶️
+    pub const GOAL_SET: &str = "dart";               // 🎯
+    pub const TODO_UPDATED: &str = "clipboard";      // 📋
+    pub const THINKING: &str = "thought_balloon";    // 💭
+    pub const HEART: &str = "heart";                 // ❤️
+    pub const THUMBS_UP: &str = "+1";                // 👍
+    pub const THUMBS_DOWN: &str = "-1";              // 👎
+    pub const STOP: &str = "stop_sign";              // 🛑
 }
 
 /// Event from Zulip event queue.
@@ -640,42 +641,33 @@ impl ZulipReactor {
                     // @palace session <subcommand>
                     self.handle_session_command(msg.id, &stream, topic, &args).await?;
                 }
-                "switch" => {
-                    // @palace switch <session_name>
-                    self.handle_switch_command(msg.id, &stream, topic, &args).await?;
-                }
-                "watch" => {
-                    // @palace watch <session_name>
-                    self.handle_watch_command(msg.id, &stream, topic, &args).await?;
-                }
-                "tell" => {
-                    // @palace tell "message"
-                    self.handle_tell_command(msg.id, &stream, topic, &args, false).await?;
-                }
-                "tell-now" => {
-                    // @palace tell-now "message" (immediate)
-                    self.handle_tell_command(msg.id, &stream, topic, &args, true).await?;
-                }
                 "ls" | "list" => {
-                    // @palace ls - list sessions
-                    self.handle_session_ls_command(msg.id, &stream, topic).await?;
+                    // @palace ls - list unapproved suggestions
+                    self.handle_ls_command(msg.id, &stream, topic).await?;
+                }
+                "next" => {
+                    // @palace next - generate new task suggestions
+                    self.handle_next_command(msg.id, &stream, topic, &args).await?;
+                }
+                "rm" | "remove" => {
+                    // @palace rm 1,2,3 or @palace rm --block 1,2,3
+                    self.handle_rm_command(msg.id, &stream, topic, &args).await?;
+                }
+                "abort" | "stop" | "cancel" => {
+                    // @palace abort - abort the session in this topic
+                    self.handle_abort_command(msg.id, &stream, topic).await?;
                 }
                 "help" => {
                     let help_text = r#"**Palace Commands:**
+- `@palace next` - Generate new task suggestions
+- `@palace ls` - List unapproved suggestions
+- `@palace approve 1,2,3` - Approve suggestions → create Plane issues
+- `@palace rm 1,2,3` - Remove suggestions
+- `@palace rm --block 1,2,3` - Remove and block similar suggestions
 - `@palace new <issue>` - Spawn a coding session for an issue
-- `@palace session new <issue>` - Same as new
-- `@palace session ls` - List all sessions
-- `@palace ls` - Short for session ls
-- `@palace switch <name>` - Switch active session
-- `@palace watch <name>` - Watch a session (stream events)
-- `@palace tell "msg"` - Send message to active session
-- `@palace tell-now "msg"` - Immediate message to session
-- `@palace approve 1,2,3` - Create Plane issues from suggestions
-- `@palace help` - Show this help
-
-**Director Commands:**
-- `@director auto` / `go` / `start` - Auto-assign workers to prioritized tasks
-- `@director status` - Show Director status"#;
+- `@palace abort` - Abort the session in this topic
+- `@palace session ls` - List active sessions
+- `@palace help` - Show this help"#;
                     self.send(&stream, topic, help_text).await?;
                     self.mark_completed(msg.id).await?;
                 }
@@ -834,8 +826,8 @@ impl ZulipReactor {
         topic: &str,
         args: &str,
     ) -> DirectorResult<()> {
-        let issue_id = args.trim();
-        if issue_id.is_empty() {
+        let raw_issue_id = args.trim();
+        if raw_issue_id.is_empty() {
             self.send(stream, topic, "Usage: `@palace new PAL-85` or `@palace new 85`").await?;
             self.mark_failed(message_id).await?;
             return Ok(());
@@ -844,6 +836,18 @@ impl ZulipReactor {
         self.mark_in_progress(message_id).await?;
 
         let project_path = self.get_project_path(stream);
+
+        // Normalize issue ID - if bare number, prefix with project slug
+        let issue_id = if raw_issue_id.chars().all(|c| c.is_ascii_digit()) {
+            // Bare number - get project prefix from config
+            let prefix = palace_plane::ProjectConfig::load(&project_path)
+                .map(|c| c.project_slug.to_uppercase())
+                .unwrap_or_else(|_| "PAL".to_string());
+            format!("{}-{}", prefix, raw_issue_id)
+        } else {
+            raw_issue_id.to_string()
+        };
+
         tracing::info!("Creating session for {} in project {:?}", issue_id, project_path);
 
         // Auto-detect skills from project context
@@ -851,7 +855,7 @@ impl ZulipReactor {
         let mut skill_context = SkillContext::from_project(&project_path);
 
         // Try to get issue description from Plane for better skill matching
-        let issue_description = self.get_issue_description(stream, issue_id).await;
+        let issue_description = self.get_issue_description(stream, &issue_id).await;
         if let Some(desc) = &issue_description {
             skill_context = skill_context.with_task(desc);
         } else {
@@ -881,20 +885,9 @@ impl ZulipReactor {
                     detected_skills.join(", ")
                 };
 
-                // Report session created
-                let response = format!(
-                    "🚀 **Session started:** `{}` (id: `{}`)\n\n\
-                    Working on: `{}`\n\
-                    Skills: {}\n\
-                    Strategy: simple\n\n\
-                    Use `@palace watch {}` to follow progress.",
-                    session_name,
-                    session.short_id(),
-                    issue_id,
-                    skills_display,
-                    session.short_id()
-                );
-                self.send(stream, topic, &response).await?;
+                // Report session created - topic is session_name with : replaced by /
+                let session_topic = session_name.replace(":", "/");
+                self.send(stream, &session_topic, &format!("🚀 Session started: {}", session_name)).await?;
 
                 // Spawn the executor in a background task
                 let config = SessionExecutorConfig {
@@ -927,7 +920,7 @@ impl ZulipReactor {
                         if let Ok(tool) = ZulipTool::from_env_palace() {
                             let _ = tool.send(
                                 &stream_clone,
-                                &format!("palace/{}", session_name_clone),
+                                &session_name_clone.replace(":", "/"),
                                 &format!("❌ Session failed: {}", e)
                             ).await;
                         }
@@ -968,15 +961,223 @@ impl ZulipReactor {
                 // @palace session ls
                 self.handle_session_ls_command(message_id, stream, topic).await
             }
+            "clear" => {
+                // @palace session clear - remove non-running sessions
+                self.handle_session_clear_command(message_id, stream, topic).await
+            }
+            "stop" | "kill" => {
+                // @palace session stop <id>,<id> - stop specific sessions (cancel)
+                self.handle_session_stop_command(message_id, stream, topic, subargs).await
+            }
+            "rm" | "remove" | "delete" => {
+                // @palace session rm <id>,<id> - remove specific sessions entirely
+                self.handle_session_rm_command(message_id, stream, topic, subargs).await
+            }
             _ => {
-                self.send(stream, topic, "Unknown session subcommand. Use: `new`, `ls`").await?;
+                self.send(stream, topic, "Unknown session subcommand. Use: `new`, `ls`, `stop`, `rm`, `clear`").await?;
                 self.mark_failed(message_id).await?;
                 Ok(())
             }
         }
     }
 
-    /// Handle @palace ls / @palace session ls - list sessions.
+    /// Handle @palace ls - list unapproved suggestions.
+    async fn handle_ls_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+
+        // Load suggestions from .palace/suggestions.json
+        let suggestions = palace_plane::load_suggestions(&project_path)
+            .unwrap_or_default();
+
+        if suggestions.is_empty() {
+            self.send(stream, topic, "No pending suggestions. Use `@palace next` to generate some.").await?;
+        } else {
+            let mut response = format!("**Pending Suggestions ({}):**\n\n", suggestions.len());
+            response.push_str("| # | Title |\n");
+            response.push_str("|---|-------|\n");
+
+            for suggestion in &suggestions {
+                response.push_str(&format!(
+                    "| {} | {} |\n",
+                    suggestion.index,
+                    suggestion.task.title
+                ));
+            }
+
+            response.push_str("\n`@palace approve 1,2,3` or `@palace rm 1,2,3`");
+
+            self.send(stream, topic, &response).await?;
+        }
+
+        self.mark_completed(message_id).await?;
+        Ok(())
+    }
+
+    /// Handle @palace rm - remove suggestions (optionally block similar ones).
+    async fn handle_rm_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+        args: &str,
+    ) -> DirectorResult<()> {
+        let args = args.trim();
+
+        // Check for --block flag
+        let (block, indices_str) = if args.starts_with("--block") {
+            (true, args.strip_prefix("--block").unwrap_or("").trim())
+        } else {
+            (false, args)
+        };
+
+        let indices = Self::parse_numbers(indices_str);
+
+        if indices.is_empty() {
+            self.send(stream, topic, "Usage: `@palace rm 1,2,3` or `@palace rm --block 1,2,3`").await?;
+            self.mark_failed(message_id).await?;
+            return Ok(());
+        }
+
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+
+        // If blocking, first get the suggestions to extract titles for blocklist
+        if block {
+            let suggestions = palace_plane::load_suggestions(&project_path).unwrap_or_default();
+            let to_block: Vec<_> = suggestions.iter()
+                .filter(|s| indices.contains(&(s.index as usize)))
+                .map(|s| s.task.title.clone())
+                .collect();
+
+            if !to_block.is_empty() {
+                // Append to blocklist
+                if let Err(e) = palace_plane::append_blocklist(&project_path, &to_block) {
+                    tracing::warn!("Failed to update blocklist: {}", e);
+                }
+            }
+        }
+
+        // Remove the suggestions
+        match palace_plane::remove_suggestions(&project_path, &indices) {
+            Ok(removed) => {
+                if removed.is_empty() {
+                    self.send(stream, topic, "No suggestions matched those indices.").await?;
+                    self.mark_failed(message_id).await?;
+                } else {
+                    let action = if block { "Removed and blocked" } else { "Removed" };
+                    let mut response = format!("**{} {} suggestion(s):**\n", action, removed.len());
+                    for s in &removed {
+                        response.push_str(&format!("- #{} {}\n", s.index, s.task.title));
+                    }
+                    self.send(stream, topic, &response).await?;
+                    self.mark_completed(message_id).await?;
+                }
+            }
+            Err(e) => {
+                self.send(stream, topic, &format!("Failed to remove: {}", e)).await?;
+                self.mark_failed(message_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle @palace abort - abort session in the current topic.
+    async fn handle_abort_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        // Find session matching this topic
+        // Topic format is like "issue/PAL-60" - convert back to session name "issue:PAL-60"
+        let session_name = topic.replace("/", ":");
+
+        let project_path = self.get_project_path(stream);
+        let manager = self.get_session_manager(&project_path).await;
+
+        // Find and cancel the session
+        if let Some(session) = manager.find_session(&session_name).await {
+            let _ = manager.cancel_session(session.id).await;
+            self.set_active_session(stream, None).await;
+
+            self.send(stream, topic, &format!(
+                "🛑 **Session aborted**\n\nSession `{}` cancelled.",
+                session.name
+            )).await?;
+            self.mark_completed(message_id).await?;
+        } else {
+            self.send(stream, topic, &format!(
+                "No active session found for topic `{}`",
+                topic
+            )).await?;
+            self.mark_failed(message_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle @palace next - generate new task suggestions.
+    async fn handle_next_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+        args: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+
+        // Parse optional count from args
+        let count: Option<usize> = args.trim().parse().ok();
+
+        self.send(stream, topic, "Analyzing codebase and generating suggestions...").await?;
+
+        // Generate suggestions
+        match palace_plane::generate_suggestions_with_options(&project_path, None, count, None).await {
+            Ok(suggestions) => {
+                if suggestions.is_empty() {
+                    self.send(stream, topic, "No suggestions generated. The codebase may be in good shape!").await?;
+                } else {
+                    let mut response = format!("**Generated {} suggestions:**\n\n", suggestions.len());
+
+                    for suggestion in &suggestions {
+                        let priority = format!("{:?}", suggestion.task.priority);
+                        response.push_str(&format!(
+                            "**#{}** {} `[{}]`\n",
+                            suggestion.index,
+                            suggestion.task.title,
+                            priority
+                        ));
+                    }
+
+                    response.push_str("\nUse `@palace ls` to see details, `@palace approve 1,2,3` to create issues.");
+
+                    self.send(stream, topic, &response).await?;
+                }
+                self.mark_completed(message_id).await?;
+            }
+            Err(e) => {
+                self.send(stream, topic, &format!("Failed to generate suggestions: {}", e)).await?;
+                self.mark_failed(message_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle @palace session ls - list sessions.
     async fn handle_session_ls_command(
         &self,
         message_id: u64,
@@ -990,32 +1191,163 @@ impl ZulipReactor {
         let sessions = manager.list_sessions().await;
 
         if sessions.is_empty() {
-            self.send(stream, topic, "No sessions. Use `@palace work PAL-85` to start one.").await?;
+            self.send(stream, topic, "No sessions. Use `@palace new PAL-85` to start one.").await?;
         } else {
             let active_id = self.get_active_session(stream).await;
             let mut response = String::from("**Sessions:**\n\n");
-            response.push_str("| ID | Name | Status | Progress |\n");
+            response.push_str("| # | Name | Status | Progress |\n");
             response.push_str("|---|---|---|---|\n");
 
-            for session in sessions {
+            for (i, session) in sessions.iter().enumerate() {
                 let is_active = active_id == Some(session.id);
-                let marker = if is_active { "➤ " } else { "" };
+                let marker = if is_active { "➤" } else { "" };
                 let progress = if session.tasks_total > 0 {
                     format!("{}/{}", session.tasks_completed, session.tasks_total)
                 } else {
                     "-".to_string()
                 };
                 response.push_str(&format!(
-                    "| {}`{}` | {} | {} | {} |\n",
+                    "| {}{} | {} | {} | {} |\n",
                     marker,
-                    session.short_id(),
+                    i + 1,
                     session.name,
                     session.status,
                     progress
                 ));
             }
+            response.push_str("\n`@palace session stop 1,2` or `@palace session rm 3`");
             self.send(stream, topic, &response).await?;
         }
+
+        self.mark_completed(message_id).await?;
+        Ok(())
+    }
+
+    /// Handle @palace session clear - clear all non-running sessions.
+    async fn handle_session_clear_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+        let manager = self.get_session_manager(&project_path).await;
+
+        let sessions = manager.list_sessions().await;
+        let mut removed = 0;
+        for session in sessions {
+            if session.status != SessionStatus::Running {
+                let _ = manager.remove_session(session.id).await;
+                removed += 1;
+            }
+        }
+        self.send(stream, topic, &format!("Cleared {} sessions.", removed)).await?;
+
+        self.mark_completed(message_id).await?;
+        Ok(())
+    }
+
+    /// Handle @palace session stop 1,2,3 - stop (cancel) specific sessions by number.
+    async fn handle_session_stop_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+        args: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+        let manager = self.get_session_manager(&project_path).await;
+        let sessions = manager.list_sessions().await;
+
+        let nums: Vec<usize> = args.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+
+        if nums.is_empty() {
+            self.send(stream, topic, "Usage: `@palace session stop 1,2,3`").await?;
+            self.mark_failed(message_id).await?;
+            return Ok(());
+        }
+
+        let mut stopped = Vec::new();
+        let mut not_found = Vec::new();
+
+        for num in nums {
+            if num > 0 && num <= sessions.len() {
+                let session = &sessions[num - 1];
+                let _ = manager.cancel_session(session.id).await;
+                stopped.push(format!("{} ({})", num, session.name));
+            } else {
+                not_found.push(num.to_string());
+            }
+        }
+
+        let mut response = String::new();
+        if !stopped.is_empty() {
+            response.push_str(&format!("Stopped: {}\n", stopped.join(", ")));
+        }
+        if !not_found.is_empty() {
+            response.push_str(&format!("Not found: {}", not_found.join(", ")));
+        }
+        self.send(stream, topic, &response).await?;
+
+        self.mark_completed(message_id).await?;
+        Ok(())
+    }
+
+    /// Handle @palace session rm 1,2,3 - remove specific sessions by number.
+    async fn handle_session_rm_command(
+        &self,
+        message_id: u64,
+        stream: &str,
+        topic: &str,
+        args: &str,
+    ) -> DirectorResult<()> {
+        self.mark_in_progress(message_id).await?;
+
+        let project_path = self.get_project_path(stream);
+        let manager = self.get_session_manager(&project_path).await;
+        let sessions = manager.list_sessions().await;
+
+        let nums: Vec<usize> = args.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+
+        if nums.is_empty() {
+            self.send(stream, topic, "Usage: `@palace session rm 1,2,3`").await?;
+            self.mark_failed(message_id).await?;
+            return Ok(());
+        }
+
+        let mut removed = Vec::new();
+        let mut not_found = Vec::new();
+
+        // Sort descending so indices don't shift as we remove
+        let mut sorted_nums = nums.clone();
+        sorted_nums.sort_by(|a, b| b.cmp(a));
+
+        for num in sorted_nums {
+            if num > 0 && num <= sessions.len() {
+                let session = &sessions[num - 1];
+                let _ = manager.remove_session(session.id).await;
+                removed.push(format!("{} ({})", num, session.name));
+            } else {
+                not_found.push(num.to_string());
+            }
+        }
+
+        let mut response = String::new();
+        if !removed.is_empty() {
+            response.push_str(&format!("Removed: {}\n", removed.join(", ")));
+        }
+        if !not_found.is_empty() {
+            response.push_str(&format!("Not found: {}", not_found.join(", ")));
+        }
+        self.send(stream, topic, &response).await?;
 
         self.mark_completed(message_id).await?;
         Ok(())
@@ -1139,8 +1471,8 @@ impl ZulipReactor {
         }
 
         response.push_str(&format!(
-            "\nUpdates will appear in topic `palace/{}`",
-            session.name
+            "\nUpdates → `{}`",
+            session.name.replace(":", "/")
         ));
 
         self.send(stream, topic, &response).await?;
@@ -1174,7 +1506,7 @@ impl ZulipReactor {
                     &format!("User steering: {}", message)).await;
 
                 // Send to session topic
-                self.send(stream, &format!("palace/{}", session.name),
+                self.send(stream, &session.name.replace(":", "/"),
                     &format!("📣 **Steering from human:**\n> {}", message)).await?;
 
                 self.send(stream, topic, &format!(

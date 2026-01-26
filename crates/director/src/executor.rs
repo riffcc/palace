@@ -13,7 +13,8 @@ use crate::planner::{PlanStep, StepAction, StepResult};
 use crate::state::ProjectMetrics;
 use crate::{DirectorError, DirectorResult};
 use llm_code_sdk::Client;
-use llm_code_sdk::tools::ToolRunner;
+use llm_code_sdk::tools::{Tool, ToolRunner, ToolRunnerConfig, ToolEventCallback};
+use llm_code_sdk::tools::smart::SmartReadTool;
 use llm_code_sdk::types::{MessageCreateParams, MessageParam};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -313,6 +314,67 @@ When the task is complete, summarize what you did."#;
         {
             let mut metrics = self.metrics.write().await;
             // Estimate tokens used (rough approximation)
+            metrics.llm_tokens_used += (prompt.len() / 4 + output.len() / 4) as u64;
+        }
+
+        Ok(output)
+    }
+
+    /// Run a task with a callback for tool events.
+    ///
+    /// This allows real-time streaming of tool calls and results.
+    pub async fn run_task_with_callback(
+        &self,
+        task: &str,
+        callback: ToolEventCallback,
+    ) -> DirectorResult<String> {
+        if self.config.dry_run {
+            return Ok(format!("[DRY RUN] Would execute task: {}", task));
+        }
+
+        tracing::info!("Running task with callback: {}", &task[..task.len().min(100)]);
+
+        // Create LLM client
+        let client = Client::openai_compatible(&self.config.llm_url)
+            .map_err(|e| DirectorError::Execution(e.to_string()))?;
+
+        // Get all tools (exploration + editing + smart)
+        let mut tools = llm_code_sdk::create_exploration_tools(&self.config.project_path);
+        tools.extend(llm_code_sdk::create_editing_tools(&self.config.project_path));
+        // Add SmartRead for intelligent code reading with AST awareness
+        tools.push(Arc::new(SmartReadTool::new(&self.config.project_path)) as Arc<dyn Tool>);
+
+        // Create tool runner with callback
+        let config = ToolRunnerConfig {
+            on_event: Some(callback),
+            ..Default::default()
+        };
+        let runner = ToolRunner::with_config(client, tools, config);
+
+        // Create the task prompt with system context
+        let system = r#"You are a software development agent working on a codebase.
+You have access to tools to read files, search code, and make edits.
+Work methodically to complete the given task.
+Always verify your changes by reading the files after editing.
+If you encounter errors, analyze them and try to fix them.
+When the task is complete, summarize what you did."#;
+
+        let prompt = format!("{}\n\nTask:\n{}", system, task);
+
+        // Run the tool loop
+        let result = runner.run(MessageCreateParams {
+            model: self.config.model.clone(),
+            max_tokens: self.config.max_tokens,
+            messages: vec![MessageParam::user(&prompt)],
+            ..Default::default()
+        }).await.map_err(|e| DirectorError::Execution(e.to_string()))?;
+
+        // Extract the final response
+        let output = result.text().unwrap_or_default().to_string();
+
+        // Update metrics
+        {
+            let mut metrics = self.metrics.write().await;
             metrics.llm_tokens_used += (prompt.len() / 4 + output.len() / 4) as u64;
         }
 

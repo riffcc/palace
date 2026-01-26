@@ -233,6 +233,10 @@ When operating, identify by machine name, not "claude-code":
 
 **Working around broken tools is BANNED.** If a tool doesn't work, fix the tool. Don't find clever workarounds that hide the problem.
 
+**TRUNCATION IS BANNED.** Never truncate output, logs, or data without explicit user request.
+If output is long, show ALL of it. The user needs to see what's happening.
+Arbitrary limits like `output[..200]` or `if len > 500` are forbidden.
+
 ### EAT YOUR OWN DOGFOOD
 
 **Use `pal call` extensively for CODE operations:**

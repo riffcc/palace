@@ -152,6 +152,48 @@ pub fn remove_suggestions(project_path: &Path, indices: &[usize]) -> Result<Vec<
     Ok(removed)
 }
 
+/// Append titles to the blocklist (.palace/blocklist.txt).
+/// Blocked titles are checked during suggestion generation to filter duplicates.
+pub fn append_blocklist(project_path: &Path, titles: &[String]) -> Result<()> {
+    let palace_dir = project_path.join(".palace");
+    std::fs::create_dir_all(&palace_dir)?;
+    let blocklist_file = palace_dir.join("blocklist.txt");
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&blocklist_file)?;
+
+    for title in titles {
+        writeln!(file, "{}", title)?;
+    }
+
+    Ok(())
+}
+
+/// Load the blocklist (.palace/blocklist.txt).
+pub fn load_blocklist(project_path: &Path) -> Result<Vec<String>> {
+    let blocklist_file = project_path.join(".palace/blocklist.txt");
+
+    if !blocklist_file.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(&blocklist_file)?;
+    Ok(content.lines().map(|s| s.to_string()).collect())
+}
+
+/// Check if a title is blocked (case-insensitive substring match).
+pub fn is_blocked(project_path: &Path, title: &str) -> bool {
+    let blocklist = load_blocklist(project_path).unwrap_or_default();
+    let title_lower = title.to_lowercase();
+    blocklist.iter().any(|blocked| {
+        let blocked_lower = blocked.to_lowercase();
+        title_lower.contains(&blocked_lower) || blocked_lower.contains(&title_lower)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
