@@ -63,6 +63,8 @@ mod zulip_reporter;
 mod zulip_stream;
 mod recursive_survey;
 mod zulip_tool;
+#[cfg(test)]
+mod test_harness;
 
 pub use agent_tools::{ZulipAgentTool, PlaneAgentTool};
 pub use control::{ControlServer, ControlClient, ControlCommand, ControlResponse, GrepMatch, ToolCallResult, socket_path};

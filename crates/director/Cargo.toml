@@ -18,7 +18,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy.workspace = true
 futures.workspace = true
 html-escape = "0.2"
-llm-code-sdk = { path = "../llm-code-sdk" }
+llm-code-sdk = { path = "../llm-code-sdk", features = ["smart"] }
 mountain = { path = "../mountain" }
 palace-plane = { path = "../palace-plane" }
 regex = "1"

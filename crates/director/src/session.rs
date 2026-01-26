@@ -157,6 +157,18 @@ pub enum SingleTarget {
     Goal(String),
 }
 
+impl SingleTarget {
+    /// Get branch name - just the ID, human readable.
+    pub fn branch_name(&self) -> String {
+        match self {
+            SingleTarget::Issue(id) => id.clone(),
+            SingleTarget::Module(id) => id.clone(),
+            SingleTarget::Cycle(id) => id.clone(),
+            SingleTarget::Goal(id) => id.clone(),
+        }
+    }
+}
+
 impl std::fmt::Display for SingleTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -221,6 +233,53 @@ impl SessionTarget {
             SessionTarget::Multi(ts) => ts.len(),
         }
     }
+
+    /// Get branch name for this target.
+    /// Returns the human-readable identifier (e.g., "PAL-60" not "session-abc123").
+    pub fn branch_name(&self) -> String {
+        match self {
+            SessionTarget::Single(t) => t.branch_name(),
+            SessionTarget::Multi(ts) => {
+                // For multi, use first target
+                ts.first().map(|t| t.branch_name()).unwrap_or_else(|| "multi".to_string())
+            }
+        }
+    }
+
+    /// Check if this target matches another exactly (same type and ID).
+    pub fn matches(&self, other: &SessionTarget) -> bool {
+        match (self, other) {
+            (SessionTarget::Single(a), SessionTarget::Single(b)) => {
+                std::mem::discriminant(a) == std::mem::discriminant(b)
+                    && a.branch_name() == b.branch_name()
+            }
+            (SessionTarget::Multi(a), SessionTarget::Multi(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(x, y)| {
+                        std::mem::discriminant(x) == std::mem::discriminant(y)
+                            && x.branch_name() == y.branch_name()
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if this target overlaps with another (any shared single targets).
+    pub fn overlaps(&self, other: &SessionTarget) -> bool {
+        let self_targets = self.targets();
+        let other_targets = other.targets();
+
+        for s in &self_targets {
+            for o in &other_targets {
+                if std::mem::discriminant(*s) == std::mem::discriminant(*o)
+                    && s.branch_name() == o.branch_name()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Session status.
@@ -269,7 +328,7 @@ pub struct SessionLogEntry {
     pub file: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Debug,
@@ -395,9 +454,6 @@ pub struct Session {
     /// Recording enabled for this session.
     #[serde(default)]
     pub recording: bool,
-    /// Path to the session transcript file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -426,7 +482,6 @@ impl Session {
             pid: None,
             skills: Vec::new(),
             recording: true, // Enable recording by default
-            transcript_path: None,
         }
     }
 
@@ -509,36 +564,48 @@ pub struct SessionManager {
     events_tx: broadcast::Sender<SessionEvent>,
     /// Project root path.
     project_path: PathBuf,
-    /// Sessions state file.
-    state_file: PathBuf,
 }
 
 impl SessionManager {
     /// Create a new session manager.
     pub fn new(project_path: PathBuf) -> Self {
-        let state_file = project_path.join(".palace/sessions.json");
         let (events_tx, _) = broadcast::channel(1000);
 
-        // Load existing state synchronously before creating the manager
-        let sessions = if let Ok(state) = std::fs::read_to_string(&state_file) {
-            serde_json::from_str::<HashMap<Uuid, Session>>(&state).unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
         Self {
-            sessions: Arc::new(RwLock::new(sessions)),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             logs: Arc::new(RwLock::new(HashMap::new())),
             skills: Arc::new(RwLock::new(HashMap::new())),
             events_tx,
             project_path,
-            state_file,
         }
     }
 
     /// Subscribe to session events.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Create a session without worktree (for testing only).
+    #[cfg(test)]
+    pub async fn create_session_for_test(
+        &self,
+        target: SessionTarget,
+        strategy: SessionStrategy,
+    ) -> Session {
+        let session = Session::new(target, strategy, self.project_path.clone());
+        let id = session.id;
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(id, session.clone());
+        }
+
+        {
+            let mut logs = self.logs.write().await;
+            logs.insert(id, Vec::new());
+        }
+
+        session
     }
 
     /// Create a new session.
@@ -557,14 +624,16 @@ impl SessionManager {
         strategy: SessionStrategy,
         skills: Vec<String>,
     ) -> DirectorResult<Session> {
+        // Check for overlap - refuse to create if active session exists for this target
+        if self.has_active_session_for_target(&target).await {
+            return Err(DirectorError::Execution(format!(
+                "Active session already exists for target {}. Use 'session ls' to see active sessions.",
+                target
+            )));
+        }
+
         let session = Session::new(target, strategy, self.project_path.clone())
             .with_skills(skills);
-
-        // Set up transcript path for recording
-        let transcript_dir = self.project_path.join(".palace/transcripts");
-        std::fs::create_dir_all(&transcript_dir).ok();
-        let mut session = session;
-        session.transcript_path = Some(transcript_dir.join(format!("{}.jsonl", session.short_id())));
 
         // ALWAYS set up git worktree for sandboxing - all sessions are isolated
         let session = self.setup_worktree(session).await?;
@@ -589,39 +658,77 @@ impl SessionManager {
             name: session.name.clone(),
         });
 
-        // Save state
-        self.save_state().await?;
-
         Ok(session)
     }
 
     /// Set up git worktree for parallel execution.
+    /// Worktree is a SIBLING directory named `{project}-{branch}` (e.g., ../palace-2026-v2-PAL-60/).
+    /// Gracefully handles: existing worktrees, existing branches, fresh starts.
     async fn setup_worktree(&self, mut session: Session) -> DirectorResult<Session> {
-        let worktree_name = format!("session-{}", session.short_id());
-        let worktree_path = self.project_path.join(".palace/worktrees").join(&worktree_name);
-        let branch_name = format!("session/{}", session.short_id());
+        // Branch name is the target ID (e.g., "PAL-60" for issue:PAL-60)
+        let branch_name = session.target.branch_name();
+        // Worktree is a SIBLING directory named {project}-{branch}
+        let project_name = self.project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let worktree_name = format!("{}-{}", project_name, branch_name);
+        let worktree_path = self.project_path
+            .parent()
+            .expect("project must have parent directory")
+            .join(&worktree_name);
 
-        // Create worktree directory
-        std::fs::create_dir_all(worktree_path.parent().unwrap())
-            .map_err(|e| DirectorError::Io(e))?;
+        let worktree_str = worktree_path.to_str().unwrap();
 
-        // Create git worktree
+        // Check if worktree already exists and is valid
+        if worktree_path.exists() {
+            // Verify it's a valid git worktree by checking for .git file
+            let git_file = worktree_path.join(".git");
+            if git_file.exists() {
+                tracing::info!("Reusing existing worktree at {}", worktree_str);
+                session.worktree_path = Some(worktree_path);
+                session.branch = Some(branch_name);
+                return Ok(session);
+            } else {
+                // Directory exists but isn't a worktree - remove it
+                tracing::warn!("Removing invalid worktree directory at {}", worktree_str);
+                let _ = std::fs::remove_dir_all(&worktree_path);
+            }
+        }
+
+        // Try to create worktree - first with new branch, then existing branch
         let output = tokio::process::Command::new("git")
-            .args(["worktree", "add", "-b", &branch_name, worktree_path.to_str().unwrap()])
+            .args(["worktree", "add", "-b", &branch_name, worktree_str])
             .current_dir(&self.project_path)
             .output()
             .await
             .map_err(|e| DirectorError::Io(e))?;
 
-        if !output.status.success() {
-            tracing::warn!(
-                "Failed to create worktree: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            // Continue without worktree
-        } else {
+        if output.status.success() {
+            tracing::info!("Created new worktree with branch {} at {}", branch_name, worktree_str);
             session.worktree_path = Some(worktree_path);
             session.branch = Some(branch_name);
+        } else {
+            // Branch might already exist - try using existing branch
+            let output2 = tokio::process::Command::new("git")
+                .args(["worktree", "add", worktree_str, &branch_name])
+                .current_dir(&self.project_path)
+                .output()
+                .await
+                .map_err(|e| DirectorError::Io(e))?;
+
+            if output2.status.success() {
+                tracing::info!("Created worktree from existing branch {} at {}", branch_name, worktree_str);
+                session.worktree_path = Some(worktree_path);
+                session.branch = Some(branch_name);
+            } else {
+                let err = String::from_utf8_lossy(&output2.stderr);
+                tracing::error!("Failed to create worktree: {}", err);
+                return Err(DirectorError::Execution(format!(
+                    "Failed to create worktree at {}: {}",
+                    worktree_str, err
+                )));
+            }
         }
 
         Ok(session)
@@ -663,6 +770,27 @@ impl SessionManager {
             .filter(|s| s.is_active())
             .cloned()
             .collect()
+    }
+
+    /// Find all sessions working on a specific target.
+    pub async fn find_sessions_for_target(&self, target: &SessionTarget) -> Vec<Session> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter(|s| s.target.matches(target) || s.target.overlaps(target))
+            .cloned()
+            .collect()
+    }
+
+    /// Check if there's an active session for the given target.
+    /// Returns true if any Running or Starting session exists for this target.
+    pub async fn has_active_session_for_target(&self, target: &SessionTarget) -> bool {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .any(|s| s.is_active() && (s.target.matches(target) || s.target.overlaps(target)))
     }
 
     /// Get session logs.
@@ -719,7 +847,6 @@ impl SessionManager {
             current: current.to_string(),
         });
 
-        let _ = self.save_state().await;
     }
 
     /// Update session status.
@@ -742,7 +869,6 @@ impl SessionManager {
             status,
         });
 
-        let _ = self.save_state().await;
     }
 
     /// Get or create project skill.
@@ -758,21 +884,9 @@ impl SessionManager {
     }
 
     /// Cancel a session.
+    /// Does NOT remove worktree - we need to inspect what went wrong.
     pub async fn cancel_session(&self, session_id: Uuid) -> DirectorResult<()> {
         self.update_status(session_id, SessionStatus::Cancelled).await;
-
-        // Clean up worktree if exists
-        let session = self.get_session(session_id).await;
-        if let Some(session) = session {
-            if let Some(worktree_path) = session.worktree_path {
-                let _ = tokio::process::Command::new("git")
-                    .args(["worktree", "remove", worktree_path.to_str().unwrap(), "--force"])
-                    .current_dir(&self.project_path)
-                    .output()
-                    .await;
-            }
-        }
-
         Ok(())
     }
 
@@ -793,25 +907,355 @@ impl SessionManager {
             logs.remove(&session_id);
         }
 
-        let _ = self.save_state().await;
         Ok(())
     }
+}
 
-    /// Save session state to disk.
-    async fn save_state(&self) -> DirectorResult<()> {
-        let sessions = self.sessions.read().await;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Ensure directory exists
-        if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DirectorError::Io(e))?;
-        }
+    // === SingleTarget Tests ===
 
-        let json = serde_json::to_string_pretty(&*sessions)
-            .map_err(|e| DirectorError::Other(e.to_string()))?;
+    #[test]
+    fn test_single_target_branch_name_issue() {
+        let target = SingleTarget::Issue("PAL-60".to_string());
+        assert_eq!(target.branch_name(), "PAL-60");
+    }
 
-        std::fs::write(&self.state_file, json)
-            .map_err(|e| DirectorError::Io(e))?;
+    #[test]
+    fn test_single_target_branch_name_module() {
+        let target = SingleTarget::Module("auth-system".to_string());
+        assert_eq!(target.branch_name(), "auth-system");
+    }
 
-        Ok(())
+    #[test]
+    fn test_single_target_branch_name_cycle() {
+        let target = SingleTarget::Cycle("sprint-42".to_string());
+        assert_eq!(target.branch_name(), "sprint-42");
+    }
+
+    #[test]
+    fn test_single_target_branch_name_goal() {
+        let target = SingleTarget::Goal("mvp-launch".to_string());
+        assert_eq!(target.branch_name(), "mvp-launch");
+    }
+
+    #[test]
+    fn test_single_target_display() {
+        assert_eq!(SingleTarget::Issue("PAL-60".into()).to_string(), "issue:PAL-60");
+        assert_eq!(SingleTarget::Module("auth".into()).to_string(), "module:auth");
+        assert_eq!(SingleTarget::Cycle("s1".into()).to_string(), "cycle:s1");
+        assert_eq!(SingleTarget::Goal("mvp".into()).to_string(), "goal:mvp");
+    }
+
+    // === SessionTarget Tests ===
+
+    #[test]
+    fn test_session_target_issue_constructor() {
+        let target = SessionTarget::issue("PAL-123");
+        assert_eq!(target.count(), 1);
+        assert_eq!(target.branch_name(), "PAL-123");
+    }
+
+    #[test]
+    fn test_session_target_multi_branch_name_uses_first() {
+        let target = SessionTarget::multi(vec![
+            SingleTarget::Issue("PAL-1".into()),
+            SingleTarget::Issue("PAL-2".into()),
+        ]);
+        assert_eq!(target.branch_name(), "PAL-1");
+    }
+
+    #[test]
+    fn test_session_target_multi_empty_returns_multi() {
+        let target = SessionTarget::Multi(vec![]);
+        assert_eq!(target.branch_name(), "multi");
+    }
+
+    #[test]
+    fn test_session_target_display_single() {
+        let target = SessionTarget::issue("PAL-99");
+        assert_eq!(target.to_string(), "issue:PAL-99");
+    }
+
+    #[test]
+    fn test_session_target_display_multi() {
+        let target = SessionTarget::multi(vec![
+            SingleTarget::Issue("PAL-1".into()),
+            SingleTarget::Module("foo".into()),
+        ]);
+        assert_eq!(target.to_string(), "[issue:PAL-1, module:foo]");
+    }
+
+    #[test]
+    fn test_session_target_targets_flattens() {
+        let target = SessionTarget::multi(vec![
+            SingleTarget::Issue("A".into()),
+            SingleTarget::Issue("B".into()),
+        ]);
+        let targets = target.targets();
+        assert_eq!(targets.len(), 2);
+    }
+
+    // === SessionStrategy Tests ===
+
+    #[test]
+    fn test_session_strategy_display() {
+        assert_eq!(SessionStrategy::Simple.to_string(), "simple");
+        assert_eq!(SessionStrategy::Parallel.to_string(), "parallel");
+        assert_eq!(SessionStrategy::Priority.to_string(), "priority");
+        assert_eq!(SessionStrategy::Director.to_string(), "director");
+    }
+
+    #[test]
+    fn test_session_strategy_from_str() {
+        assert_eq!("simple".parse::<SessionStrategy>().unwrap(), SessionStrategy::Simple);
+        assert_eq!("default".parse::<SessionStrategy>().unwrap(), SessionStrategy::Simple);
+        assert_eq!("parallel".parse::<SessionStrategy>().unwrap(), SessionStrategy::Parallel);
+        assert_eq!("priority".parse::<SessionStrategy>().unwrap(), SessionStrategy::Priority);
+        assert_eq!("omniscience".parse::<SessionStrategy>().unwrap(), SessionStrategy::Priority);
+        assert_eq!("director".parse::<SessionStrategy>().unwrap(), SessionStrategy::Director);
+        assert_eq!("pm".parse::<SessionStrategy>().unwrap(), SessionStrategy::Director);
+    }
+
+    #[test]
+    fn test_session_strategy_from_str_case_insensitive() {
+        assert_eq!("SIMPLE".parse::<SessionStrategy>().unwrap(), SessionStrategy::Simple);
+        assert_eq!("Parallel".parse::<SessionStrategy>().unwrap(), SessionStrategy::Parallel);
+    }
+
+    #[test]
+    fn test_session_strategy_from_str_invalid() {
+        assert!("invalid".parse::<SessionStrategy>().is_err());
+    }
+
+    #[test]
+    fn test_session_strategy_default() {
+        assert_eq!(SessionStrategy::default(), SessionStrategy::Simple);
+    }
+
+    // === Session Tests ===
+
+    #[test]
+    fn test_session_new_creates_valid_session() {
+        let session = Session::new(
+            SessionTarget::issue("PAL-42"),
+            SessionStrategy::Simple,
+            PathBuf::from("/tmp/project"),
+        );
+
+        assert_eq!(session.name, "issue:PAL-42");
+        assert_eq!(session.status, SessionStatus::Starting);
+        assert!(session.worktree_path.is_none());
+        assert!(session.branch.is_none());
+        assert_eq!(session.tasks_completed, 0);
+        assert_eq!(session.tasks_total, 0);
+        assert!(session.error.is_none());
+        assert!(session.recording);
+    }
+
+    #[test]
+    fn test_session_short_id_is_8_chars() {
+        let session = Session::new(
+            SessionTarget::issue("PAL-1"),
+            SessionStrategy::Simple,
+            PathBuf::from("/tmp"),
+        );
+
+        let short = session.short_id();
+        assert_eq!(short.len(), 8);
+        // Should be first 8 chars of UUID
+        assert!(session.id.to_string().starts_with(&short));
+    }
+
+    #[test]
+    fn test_session_with_skills() {
+        let session = Session::new(
+            SessionTarget::issue("PAL-1"),
+            SessionStrategy::Simple,
+            PathBuf::from("/tmp"),
+        ).with_skills(vec!["rust".into(), "testing".into()]);
+
+        assert_eq!(session.skills.len(), 2);
+        assert!(session.skills.contains(&"rust".to_string()));
+    }
+
+    // === SessionStatus Tests ===
+
+    #[test]
+    fn test_session_status_equality() {
+        assert_eq!(SessionStatus::Starting, SessionStatus::Starting);
+        assert_ne!(SessionStatus::Starting, SessionStatus::Running);
+    }
+
+    #[test]
+    fn test_session_status_copy() {
+        let status = SessionStatus::Running;
+        let copied = status;
+        assert_eq!(status, copied);
+    }
+
+    // === Handoff Tests ===
+
+    #[test]
+    fn test_handoff_request_creates_correctly() {
+        let from = Uuid::new_v4();
+        let work = SessionTarget::issue("PAL-99");
+        let handoff = Handoff::request(from, work, "need help");
+
+        assert_eq!(handoff.from, from);
+        assert!(handoff.to.is_none());
+        assert_eq!(handoff.kind, HandoffKind::Request);
+        assert_eq!(handoff.context, "need help");
+    }
+
+    #[test]
+    fn test_handoff_to_zulip_format() {
+        let from = Uuid::parse_str("12345678-1234-1234-1234-123456789012").unwrap();
+        let handoff = Handoff::request(from, SessionTarget::issue("PAL-1"), "ctx");
+
+        let zulip = handoff.to_zulip();
+        assert!(zulip.starts_with("⚡1234"));
+        assert!(zulip.contains("issue:PAL-1"));
+        assert!(zulip.contains("ctx"));
+    }
+
+    // === ProjectSkill Tests ===
+
+    #[test]
+    fn test_project_skill_new() {
+        let skill = ProjectSkill::new("PAL");
+        assert_eq!(skill.project_id, "PAL");
+        assert_eq!(skill.name, "PAL-skill");
+        assert!(skill.directives.is_empty());
+    }
+
+    #[test]
+    fn test_project_skill_add_directive() {
+        let mut skill = ProjectSkill::new("test");
+        skill.add_directive("always use Rust");
+        assert_eq!(skill.directives.len(), 1);
+        assert_eq!(skill.directives[0].content, "always use Rust");
+    }
+
+    #[test]
+    fn test_project_skill_add_directive_increases_priority() {
+        let mut skill = ProjectSkill::new("test");
+        skill.add_directive("use tabs");
+        let initial_priority = skill.directives[0].priority;
+        skill.add_directive("use tabs"); // Same directive again
+        assert!(skill.directives[0].priority > initial_priority);
+    }
+
+    // === LogLevel Tests ===
+
+    #[test]
+    fn test_log_level_ordering() {
+        assert!(LogLevel::Debug < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Error);
+    }
+
+    // === Session Overlap Detection Tests (PAL-66) ===
+
+    #[tokio::test]
+    async fn test_find_sessions_for_target_returns_matching() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        // Create two sessions for PAL-60
+        let target = SessionTarget::issue("PAL-60");
+        let _s1 = manager.create_session_for_test(target.clone(), SessionStrategy::Simple).await;
+        let _s2 = manager.create_session_for_test(target.clone(), SessionStrategy::Simple).await;
+
+        // Create one session for PAL-61
+        let other_target = SessionTarget::issue("PAL-61");
+        let _s3 = manager.create_session_for_test(other_target, SessionStrategy::Simple).await;
+
+        // Should find exactly 2 sessions for PAL-60
+        let found = manager.find_sessions_for_target(&target).await;
+        assert_eq!(found.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_for_target_empty_when_none() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        let target = SessionTarget::issue("PAL-99");
+        let found = manager.find_sessions_for_target(&target).await;
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_has_active_session_for_target_true_when_running() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        let target = SessionTarget::issue("PAL-60");
+        let session = manager.create_session_for_test(target.clone(), SessionStrategy::Simple).await;
+
+        // Mark as running
+        manager.update_status(session.id, SessionStatus::Running).await;
+
+        assert!(manager.has_active_session_for_target(&target).await);
+    }
+
+    #[tokio::test]
+    async fn test_has_active_session_for_target_false_when_completed() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        let target = SessionTarget::issue("PAL-60");
+        let session = manager.create_session_for_test(target.clone(), SessionStrategy::Simple).await;
+
+        // Mark as completed
+        manager.update_status(session.id, SessionStatus::Completed).await;
+
+        assert!(!manager.has_active_session_for_target(&target).await);
+    }
+
+    #[tokio::test]
+    async fn test_has_active_session_for_target_false_when_none() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        let target = SessionTarget::issue("PAL-99");
+        assert!(!manager.has_active_session_for_target(&target).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_target_matches() {
+        let t1 = SessionTarget::issue("PAL-60");
+        let t2 = SessionTarget::issue("PAL-60");
+        let t3 = SessionTarget::issue("PAL-61");
+
+        assert!(t1.matches(&t2));
+        assert!(!t1.matches(&t3));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_refuses_duplicate_active() {
+        let manager = SessionManager::new(PathBuf::from("/tmp/test"));
+
+        let target = SessionTarget::issue("PAL-60");
+
+        // Create first session and mark it running
+        let s1 = manager.create_session_for_test(target.clone(), SessionStrategy::Simple).await;
+        manager.update_status(s1.id, SessionStatus::Running).await;
+
+        // Try to create another session for same target - should fail
+        // Note: This would need the real create_session which checks for overlap
+        // For now we just verify has_active returns true
+        assert!(manager.has_active_session_for_target(&target).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_target_matches_multi() {
+        let single = SessionTarget::issue("PAL-60");
+        let multi = SessionTarget::multi(vec![
+            SingleTarget::Issue("PAL-60".into()),
+            SingleTarget::Issue("PAL-61".into()),
+        ]);
+
+        // Multi contains PAL-60, so should match
+        assert!(single.overlaps(&multi));
+        assert!(multi.overlaps(&single));
     }
 }

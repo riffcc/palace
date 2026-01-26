@@ -193,6 +193,8 @@ pub struct ZulipReactor {
     session_managers: Arc<RwLock<HashMap<PathBuf, Arc<SessionManager>>>>,
     /// Currently active session per stream.
     active_sessions: Arc<RwLock<HashMap<String, Uuid>>>,
+    /// Running task handles for abort.
+    running_tasks: Arc<RwLock<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
 }
 
 impl ZulipReactor {
@@ -267,6 +269,7 @@ impl ZulipReactor {
             bot_user_id: None,
             session_managers: Arc::new(RwLock::new(HashMap::new())),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            running_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -911,7 +914,7 @@ impl ZulipReactor {
                 let stream_clone = stream.to_string();
                 let session_name_clone = session_name.clone();
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let mut executor = SessionExecutor::new(config, manager_clone);
                     tracing::info!("Executor created for session {}, starting execution...", session_id);
                     if let Err(e) = executor.execute(session_id).await {
@@ -928,6 +931,12 @@ impl ZulipReactor {
                         tracing::info!("Session {} completed successfully", session_id);
                     }
                 });
+
+                // Store handle for abort
+                {
+                    let mut tasks = self.running_tasks.write().await;
+                    tasks.insert(session_id, handle);
+                }
 
                 self.mark_completed(message_id).await?;
             }
@@ -1108,11 +1117,20 @@ impl ZulipReactor {
 
         // Find and cancel the session
         if let Some(session) = manager.find_session(&session_name).await {
+            // KILL the running task
+            {
+                let mut tasks = self.running_tasks.write().await;
+                if let Some(handle) = tasks.remove(&session.id) {
+                    handle.abort();
+                    tracing::info!("Aborted task for session {}", session.id);
+                }
+            }
+
             let _ = manager.cancel_session(session.id).await;
             self.set_active_session(stream, None).await;
 
             self.send(stream, topic, &format!(
-                "🛑 **Session aborted**\n\nSession `{}` cancelled.",
+                "🛑 **Session KILLED**\n\nSession `{}` terminated.",
                 session.name
             )).await?;
             self.mark_completed(message_id).await?;

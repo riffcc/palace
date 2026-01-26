@@ -185,14 +185,6 @@ impl SessionExecutor {
         self.manager.update_status(session_id, SessionStatus::Running).await;
         self.manager.log(session_id, LogLevel::Info, "Session started").await;
 
-        // Report to Zulip
-        if let Some(ref mut zulip) = self.zulip {
-            let target_str = format!("{:?}", session.target);
-            if let Err(e) = zulip.session_started(session_id, &session.name, &target_str).await {
-                tracing::warn!("Failed to report session start to Zulip: {}", e);
-            }
-        }
-
         // Get working directory (worktree or project path)
         let work_dir = session.worktree_path.as_ref()
             .unwrap_or(&session.project_path)
@@ -420,21 +412,61 @@ impl SessionExecutor {
                 }
             };
 
-            while let Some(event) = rx.recv().await {
-                let msg = match event {
-                    ToolEvent::ToolCall { name, input } => {
-                        // Compact format: 🔧 Tool: key params
-                        let params = format_tool_params(&name, &input);
-                        format!("🔧 {}: {}", name, params)
-                    }
-                    ToolEvent::ToolResult { name, success, output } => {
-                        let icon = if success { "✓" } else { "✗" };
-                        format!("{} {}\n```\n{}\n```", icon, name, output)
-                    }
-                };
+            // Track last tool call message ID for editing
+            let mut last_tool_msg: Option<(String, u64, String)> = None; // (name, msg_id, params)
 
-                if let Err(e) = zulip.send(&stream, &topic, &msg).await {
-                    tracing::warn!("Failed to send tool event to Zulip: {}", e);
+            while let Some(event) = rx.recv().await {
+                match event {
+                    ToolEvent::Text { text } => {
+                        // Check if this is a thinking block
+                        if text.contains("<think>") || text.contains("</think>") {
+                            // Extract thinking content, strip tags and all whitespace
+                            let thinking: String = text
+                                .replace("<think>", "")
+                                .replace("</think>", "")
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect();
+
+                            // Only emit if there's actual content (not just whitespace/tags)
+                            if !thinking.is_empty() {
+                                // Use original with tags stripped but whitespace preserved for readability
+                                let display = text
+                                    .replace("<think>", "")
+                                    .replace("</think>", "");
+                                let display = display.trim();
+                                let msg = format!("```spoiler 💭 Thinking\n{}\n```", display);
+                                let _ = zulip.send(&stream, &topic, &msg).await;
+                            }
+                        } else {
+                            // Normal text - emit as-is if non-empty
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                let _ = zulip.send(&stream, &topic, text).await;
+                            }
+                        }
+                    }
+                    ToolEvent::ToolCall { name, input } => {
+                        // Send tool call with nice formatting
+                        let (emoji, display_name) = format_tool_name(&name);
+                        let params = format_tool_params(&name, &input);
+                        let msg = format!("{} {}: {}", emoji, display_name, params);
+                        if let Ok(msg_id) = zulip.send(&stream, &topic, &msg).await {
+                            last_tool_msg = Some((name, msg_id, params));
+                        }
+                    }
+                    ToolEvent::ToolResult { name, success, .. } => {
+                        // Edit the tool call message to append result icon
+                        if let Some((ref last_name, msg_id, ref params)) = last_tool_msg {
+                            if &name == last_name {
+                                let (emoji, display_name) = format_tool_name(&name);
+                                let result = if success { "✅" } else { "❌" };
+                                let updated = format!("{} {}: {} {}", emoji, display_name, params, result);
+                                let _ = zulip.update_message(msg_id, &updated).await;
+                            }
+                        }
+                        last_tool_msg = None;
+                    }
                 }
             }
         });
@@ -622,10 +654,7 @@ impl SessionExecutor {
             id: issue["id"].as_str().unwrap_or("").to_string(),
             sequence_id: sequence,
             name: issue["name"].as_str().unwrap_or("").to_string(),
-            description: issue["description_html"].as_str().map(|s| {
-                // Strip HTML tags for plain text
-                s.replace("<p>", "").replace("</p>", "\n").replace("<br>", "\n")
-            }),
+            description: issue["description_html"].as_str().map(|s| strip_html(s)),
         })
     }
 
@@ -650,6 +679,29 @@ struct IssueInfo {
     sequence_id: u32,
     name: String,
     description: Option<String>,
+}
+
+/// Format tool name for human display with emoji.
+fn format_tool_name(name: &str) -> (&'static str, String) {
+    // Returns (emoji, display_name)
+    match name {
+        "read_file" => ("📖", "Read".to_string()),
+        "write_file" => ("✏️", "Write".to_string()),
+        "edit_file" => ("📝", "Edit".to_string()),
+        "list_directory" => ("📁", "List".to_string()),
+        "glob" => ("🔍", "Glob".to_string()),
+        "grep" => ("🔎", "Grep".to_string()),
+        "bash" => ("💻", "Bash".to_string()),
+        "smart_read" => ("📚", "SmartRead".to_string()),
+        "smart_write" => ("✍️", "SmartWrite".to_string()),
+        "create_file" => ("📄", "Create".to_string()),
+        "delete_file" => ("🗑️", "Delete".to_string()),
+        "move_file" => ("📦", "Move".to_string()),
+        "copy_file" => ("📋", "Copy".to_string()),
+        "web_search" => ("🌐", "Search".to_string()),
+        "web_fetch" => ("🌍", "Fetch".to_string()),
+        _ => ("🔧", name.to_string()),
+    }
 }
 
 /// Format tool params in a compact human-readable way.
@@ -684,5 +736,190 @@ fn format_tool_params(tool_name: &str, input: &std::collections::HashMap<String,
                 .collect::<Vec<_>>()
                 .join(", ")
         }
+    }
+}
+
+/// Strip HTML tags from text.
+fn strip_html(html: &str) -> String {
+    // Simple regex-free HTML stripping
+    let mut result = String::new();
+    let mut in_tag = false;
+
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+
+    // Clean up whitespace
+    result
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // === format_tool_name Tests ===
+
+    #[test]
+    fn test_format_tool_name_read() {
+        let (emoji, name) = format_tool_name("read_file");
+        assert_eq!(emoji, "📖");
+        assert_eq!(name, "Read");
+    }
+
+    #[test]
+    fn test_format_tool_name_write() {
+        let (emoji, name) = format_tool_name("write_file");
+        assert_eq!(emoji, "✏️");
+        assert_eq!(name, "Write");
+    }
+
+    #[test]
+    fn test_format_tool_name_edit() {
+        let (emoji, name) = format_tool_name("edit_file");
+        assert_eq!(emoji, "📝");
+        assert_eq!(name, "Edit");
+    }
+
+    #[test]
+    fn test_format_tool_name_list() {
+        let (emoji, name) = format_tool_name("list_directory");
+        assert_eq!(emoji, "📁");
+        assert_eq!(name, "List");
+    }
+
+    #[test]
+    fn test_format_tool_name_glob() {
+        let (emoji, name) = format_tool_name("glob");
+        assert_eq!(emoji, "🔍");
+        assert_eq!(name, "Glob");
+    }
+
+    #[test]
+    fn test_format_tool_name_grep() {
+        let (emoji, name) = format_tool_name("grep");
+        assert_eq!(emoji, "🔎");
+        assert_eq!(name, "Grep");
+    }
+
+    #[test]
+    fn test_format_tool_name_bash() {
+        let (emoji, name) = format_tool_name("bash");
+        assert_eq!(emoji, "💻");
+        assert_eq!(name, "Bash");
+    }
+
+    #[test]
+    fn test_format_tool_name_unknown_returns_original() {
+        let (emoji, name) = format_tool_name("some_random_tool");
+        assert_eq!(emoji, "🔧");
+        assert_eq!(name, "some_random_tool");
+    }
+
+    // === format_tool_params Tests ===
+
+    #[test]
+    fn test_format_tool_params_read_file() {
+        let mut input = HashMap::new();
+        input.insert("path".to_string(), serde_json::json!("/foo/bar.rs"));
+
+        let result = format_tool_params("read_file", &input);
+        assert_eq!(result, "/foo/bar.rs");
+    }
+
+    #[test]
+    fn test_format_tool_params_grep() {
+        let mut input = HashMap::new();
+        input.insert("pattern".to_string(), serde_json::json!("TODO"));
+        input.insert("path".to_string(), serde_json::json!("src/"));
+
+        let result = format_tool_params("grep", &input);
+        assert_eq!(result, "`TODO` in src/");
+    }
+
+    #[test]
+    fn test_format_tool_params_bash() {
+        let mut input = HashMap::new();
+        input.insert("command".to_string(), serde_json::json!("cargo test"));
+
+        let result = format_tool_params("bash", &input);
+        assert_eq!(result, "cargo test");
+    }
+
+    #[test]
+    fn test_format_tool_params_unknown_shows_all() {
+        let mut input = HashMap::new();
+        input.insert("foo".to_string(), serde_json::json!("bar"));
+
+        let result = format_tool_params("unknown_tool", &input);
+        assert!(result.contains("foo=bar"));
+    }
+
+    // === strip_html Tests ===
+
+    #[test]
+    fn test_strip_html_removes_tags() {
+        let html = "<p>Hello</p>";
+        assert_eq!(strip_html(html), "Hello");
+    }
+
+    #[test]
+    fn test_strip_html_handles_nested_tags() {
+        let html = "<div><p><strong>Bold</strong> text</p></div>";
+        assert_eq!(strip_html(html), "Bold text");
+    }
+
+    #[test]
+    fn test_strip_html_decodes_entities() {
+        let html = "&amp; &lt; &gt; &quot; &nbsp;";
+        let result = strip_html(html);
+        assert!(result.contains("&"));
+        assert!(result.contains("<"));
+        assert!(result.contains(">"));
+        assert!(result.contains("\""));
+    }
+
+    #[test]
+    fn test_strip_html_removes_empty_lines() {
+        let html = "<p>First</p>\n\n\n<p>Second</p>";
+        let result = strip_html(html);
+        assert_eq!(result, "First\nSecond");
+    }
+
+    #[test]
+    fn test_strip_html_trims_whitespace() {
+        let html = "  <p>  Hello  </p>  ";
+        assert_eq!(strip_html(html), "Hello");
+    }
+
+    #[test]
+    fn test_strip_html_plane_paragraph() {
+        let html = r#"<p class="editor-paragraph-block">This is a task description.</p>"#;
+        assert_eq!(strip_html(html), "This is a task description.");
+    }
+
+    #[test]
+    fn test_strip_html_empty_input() {
+        assert_eq!(strip_html(""), "");
+    }
+
+    #[test]
+    fn test_strip_html_no_tags() {
+        assert_eq!(strip_html("Just plain text"), "Just plain text");
     }
 }

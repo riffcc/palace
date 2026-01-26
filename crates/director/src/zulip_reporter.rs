@@ -38,9 +38,9 @@ pub struct ZulipReporter {
 }
 
 impl ZulipReporter {
-    /// Create from environment.
+    /// Create from environment (uses Palace bot credentials).
     pub fn from_env() -> DirectorResult<Self> {
-        let tool = ZulipTool::from_env()?;
+        let tool = ZulipTool::from_env_palace()?;
         Ok(Self {
             tool,
             stream: "palace".to_string(),
