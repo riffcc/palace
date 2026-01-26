@@ -168,17 +168,63 @@ REALTIME STATE ─────────────────────�
 **Location:** `crates/director/`
 
 **Architecture:**
-Goals → Planner → Executor → Monitor,
-with Plane.so/GitHub/Human Review integration.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         DIRECTOR                             │
+│  Goals → Planner → Sessions → Executor                      │
+│     ↓         ↓          ↓          ↓                       │
+│  Plane.so  Issues   Git Worktrees  Tools                    │
+│     ↓         ↓          ↓          ↓                       │
+│              └────── Zulip ─────────┘                       │
+│                   (I/O bus for all communication)           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Subsystems:**
+
+| Subsystem | Files | Purpose |
+|-----------|-------|---------|
+| **Session Management** | `session.rs`, `session_executor.rs` | Manages work sessions in isolated git worktrees |
+| **Zulip Integration** | `zulip_reactor.rs`, `zulip_reporter.rs`, `zulip_tool.rs` | Bot commands, progress reporting, message streaming |
+| **Planning** | `planner.rs`, `goals.rs`, `issues.rs` | Task decomposition and prioritization |
+| **Execution** | `executor.rs`, `agent_tools.rs` | LLM-driven code execution with tools |
+| **Testing** | `test_harness.rs` | AI-driven exploratory test framework |
+
+**Session Lifecycle:**
+1. `@palace new PAL-60` → Creates session with git worktree at `../project-PAL-60/`
+2. Session executes with SmartRead/SmartWrite tools
+3. Progress streams to Zulip topic `palace/PAL-60`
+4. Tool calls show as `📖 Read: path ✅` or `❌`
+5. `@palace abort` kills task, preserves worktree for inspection
+
+**Zulip Bot Commands:**
+| Command | Action |
+|---------|--------|
+| `@palace new <issue>` | Start session for issue |
+| `@palace abort` | Kill running session |
+| `@palace session ls` | List active sessions |
+| `@palace approve 1,2,3` | Approve suggestions |
+| `@palace help` | Show commands |
 
 **Key Files:**
 | File | Purpose |
 |------|---------|
+| `src/session.rs` | Session, SessionManager, overlap detection |
+| `src/session_executor.rs` | Runs LLM agent loop, streams to Zulip |
+| `src/zulip_reactor.rs` | Polls Zulip events, handles commands |
+| `src/zulip_reporter.rs` | Message slots (status, tasks, progress) |
+| `src/zulip_tool.rs` | Low-level Zulip API wrapper |
+| `src/test_harness.rs` | Staged scenario testing for AI exploration |
+| `src/skill_finder.rs` | Auto-detects skills from codebase |
 | `src/project.rs` | Project management |
 | `src/goals.rs` | Goal definition with priority/status |
-| `src/issues.rs` | Issue tracking and classification |
 | `src/planner.rs` | Task planning orchestrator |
 | `src/state.rs` | Director state and metrics |
+| `src/pool.rs` | Session pool management |
+| `src/profiler.rs` | Edit success tracking (ReDB) |
+
+**Binaries:**
+- `palace-director` - Standalone director daemon (systemd)
 
 ---
 

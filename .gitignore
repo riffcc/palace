@@ -1,5 +1,10 @@
 .env
 target/
 .claude
-.palace
 synthesis/
+
+# Palace
+.palace/suggestions.json
+
+# Worktrees are sibling directories named after branches (e.g., PAL-60/)
+# They're git worktrees, git handles them

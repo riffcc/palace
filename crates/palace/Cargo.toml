@@ -62,3 +62,4 @@ spin_sleep = "1"
 
 [features]
 default = []
+smart = ["llm-code-sdk/smart"]
