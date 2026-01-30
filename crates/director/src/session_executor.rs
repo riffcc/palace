@@ -256,9 +256,11 @@ impl SessionExecutor {
         let executor_config = ExecutorConfig {
             project_path: work_dir.clone(),
             llm_url: self.config.llm_url.clone(),
+            api_key: std::env::var("ZAI_API_KEY").ok(),
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
             dry_run: false,
+            stock_tools: false,
         };
 
         let executor = Executor::new(executor_config);

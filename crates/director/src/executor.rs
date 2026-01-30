@@ -27,12 +27,16 @@ pub struct ExecutorConfig {
     pub project_path: PathBuf,
     /// LLM endpoint URL
     pub llm_url: String,
+    /// API key (required for Z.ai, optional for local)
+    pub api_key: Option<String>,
     /// Model to use for code generation
     pub model: String,
     /// Max tokens per step
     pub max_tokens: u32,
     /// Dry run mode (no actual changes)
     pub dry_run: bool,
+    /// Use stock tools only (no SmartRead) for A/B comparison
+    pub stock_tools: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -40,9 +44,47 @@ impl Default for ExecutorConfig {
         Self {
             project_path: PathBuf::from("."),
             llm_url: "http://localhost:1234/v1".to_string(),
-            model: "glm-4-plus".to_string(),
-            max_tokens: 4096,
+            api_key: None,
+            model: "GLM-4.7".to_string(),
+            max_tokens: 65536,
             dry_run: false,
+            stock_tools: false,
+        }
+    }
+}
+
+impl ExecutorConfig {
+    /// Create an LLM client based on the URL format.
+    /// - Z.ai / Anthropic URLs use Anthropic format
+    /// - OpenRouter uses OpenAI format with API key
+    /// - Other URLs use OpenAI-compatible format (no key)
+    pub fn create_client(&self) -> Result<Client, String> {
+        if self.llm_url.contains("openrouter.ai") {
+            // OpenRouter - OpenAI format with API key
+            let api_key = self.api_key.clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .ok_or_else(|| "OPENROUTER_API_KEY required for OpenRouter".to_string())?;
+
+            Client::builder(&api_key)
+                .base_url(&self.llm_url)
+                .format(llm_code_sdk::client::ApiFormat::OpenAI)
+                .build()
+                .map_err(|e| format!("{}", e))
+        } else if self.llm_url.contains("z.ai") || self.llm_url.contains("anthropic") {
+            // Anthropic-compatible format (Z.ai, Anthropic)
+            let api_key = self.api_key.clone()
+                .or_else(|| std::env::var("ZAI_API_KEY").ok())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| "ZAI_API_KEY or ANTHROPIC_API_KEY required".to_string())?;
+
+            Client::builder(&api_key)
+                .base_url(&self.llm_url)
+                .build()
+                .map_err(|e| format!("{}", e))
+        } else {
+            // OpenAI-compatible (LM Studio, Ollama, etc.) - no key required
+            Client::openai_compatible(&self.llm_url)
+                .map_err(|e| format!("{}", e))
         }
     }
 }
@@ -118,8 +160,8 @@ impl Executor {
         }
 
         // Create LLM client
-        let client = Client::openai_compatible(&self.config.llm_url)
-            .map_err(|e| DirectorError::Execution(e.to_string()))?;
+        let client = self.config.create_client()
+            .map_err(DirectorError::Execution)?;
 
         // Get editing tools
         let tools = llm_code_sdk::create_editing_tools(&self.config.project_path);
@@ -169,8 +211,8 @@ impl Executor {
     /// Execute a research step using SmartRead.
     async fn execute_research(&self, topic: &str) -> DirectorResult<StepResult> {
         // Create LLM client
-        let client = Client::openai_compatible(&self.config.llm_url)
-            .map_err(|e| DirectorError::Execution(e.to_string()))?;
+        let client = self.config.create_client()
+            .map_err(DirectorError::Execution)?;
 
         // Get exploration tools
         let tools = llm_code_sdk::create_exploration_tools(&self.config.project_path);
@@ -279,23 +321,30 @@ impl Executor {
         tracing::info!("Running task: {}", &task[..task.len().min(100)]);
 
         // Create LLM client
-        let client = Client::openai_compatible(&self.config.llm_url)
-            .map_err(|e| DirectorError::Execution(e.to_string()))?;
+        let client = self.config.create_client()
+            .map_err(DirectorError::Execution)?;
 
-        // Get all tools (exploration + editing)
+        // Get all tools (exploration + editing + smart)
         let mut tools = llm_code_sdk::create_exploration_tools(&self.config.project_path);
         tools.extend(llm_code_sdk::create_editing_tools(&self.config.project_path));
+        tools.push(Arc::new(SmartReadTool::new(&self.config.project_path)) as Arc<dyn Tool>);
 
         // Create tool runner
         let runner = ToolRunner::new(client, tools);
 
-        // Create the task prompt with system context
-        let system = r#"You are a software development agent working on a codebase.
-You have access to tools to read files, search code, and make edits.
-Work methodically to complete the given task.
-Always verify your changes by reading the files after editing.
-If you encounter errors, analyze them and try to fix them.
-When the task is complete, summarize what you did."#;
+        // Create the task prompt - emphasize multi-layer smart_read
+        let system = r#"You are a software development agent. Work FAST and MINIMAL.
+
+CRITICAL: Use smart_read with MULTIPLE layers in ONE call:
+  smart_read(path="file.py", layers=["ast", "call_graph"])
+
+Layers: ast (structure), call_graph (relationships), dfg (data flow), raw (source)
+
+Rules:
+- ONE smart_read with multiple layers beats multiple calls
+- edit_file for changes (not write_file)
+- Do NOT run tests, pip install, or execute code
+- Make MINIMAL changes only"#;
 
         let prompt = format!("{}\n\nTask:\n{}", system, task);
 
@@ -335,14 +384,17 @@ When the task is complete, summarize what you did."#;
         tracing::info!("Running task with callback: {}", &task[..task.len().min(100)]);
 
         // Create LLM client
-        let client = Client::openai_compatible(&self.config.llm_url)
-            .map_err(|e| DirectorError::Execution(e.to_string()))?;
+        let client = self.config.create_client()
+            .map_err(DirectorError::Execution)?;
 
-        // Get all tools (exploration + editing + smart)
+        // Get all tools (exploration + editing)
         let mut tools = llm_code_sdk::create_exploration_tools(&self.config.project_path);
         tools.extend(llm_code_sdk::create_editing_tools(&self.config.project_path));
-        // Add SmartRead for intelligent code reading with AST awareness
-        tools.push(Arc::new(SmartReadTool::new(&self.config.project_path)) as Arc<dyn Tool>);
+
+        // Add SmartRead unless stock_tools mode
+        if !self.config.stock_tools {
+            tools.push(Arc::new(SmartReadTool::new(&self.config.project_path)) as Arc<dyn Tool>);
+        }
 
         // Create tool runner with callback
         let config = ToolRunnerConfig {
@@ -352,12 +404,40 @@ When the task is complete, summarize what you did."#;
         let runner = ToolRunner::with_config(client, tools, config);
 
         // Create the task prompt with system context
-        let system = r#"You are a software development agent working on a codebase.
-You have access to tools to read files, search code, and make edits.
-Work methodically to complete the given task.
-Always verify your changes by reading the files after editing.
-If you encounter errors, analyze them and try to fix them.
-When the task is complete, summarize what you did."#;
+        let system = if self.config.stock_tools {
+            // Stock tools prompt - basic SWE-agent style
+            r#"You are a software development agent working on a codebase.
+
+Available tools: read_file, edit_file, grep, glob, bash, list_directory
+
+Workflow:
+1. Explore the codebase to find relevant files
+2. Read files to understand the code
+3. Make targeted edits using edit_file
+4. Verify changes
+
+Work methodically. When complete, summarize what you did."#
+        } else {
+            // SmartRead-enhanced prompt
+            r#"You are a software development agent working on a codebase.
+
+IMPORTANT: You have access to smart_read, a powerful code analysis tool. USE IT:
+- smart_read with layer="ast" shows code structure with signatures
+- smart_read with query="..." searches git history for relevant commits - USE THIS instead of manual git log/show commands!
+  Example: smart_read {"path": "migrations/file.py", "query": "permission fix"} finds commits about permission fixes
+
+For understanding how something was fixed before, or finding related changes:
+  smart_read {"path": "the/file.py", "query": "the issue or feature"}
+This returns matching commits with their descriptions and changes - no need for manual git archaeology.
+
+Workflow:
+1. Read the relevant file to understand current state
+2. If you need to understand history/prior fixes, use smart_read with query=
+3. Make targeted edits using edit_file
+4. Verify changes
+
+Work methodically. When complete, summarize what you did."#
+        };
 
         let prompt = format!("{}\n\nTask:\n{}", system, task);
 

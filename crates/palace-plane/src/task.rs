@@ -173,6 +173,7 @@ pub async fn generate_suggestions_with_options(
         max_iterations: None,
         verbose: false,
         on_event,
+        ..Default::default()
     };
 
     let project_root = project_path.display();

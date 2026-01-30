@@ -670,6 +670,7 @@ async fn main() -> anyhow::Result<()> {
                                 max_iterations: None,
                                 verbose: true,
                                 on_event: Some(event_callback),
+                                ..Default::default()
                             };
                             let runner = ToolRunner::with_config(client, tools, config);
 
