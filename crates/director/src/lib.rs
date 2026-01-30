@@ -63,6 +63,7 @@ mod zulip_reporter;
 mod zulip_stream;
 mod recursive_survey;
 mod zulip_tool;
+mod benchmark;
 #[cfg(test)]
 mod test_harness;
 
@@ -94,6 +95,11 @@ pub use zulip_reporter::{ZulipReporter, SurveyOption, TodoTask, MessageSlot};
 pub use zulip_stream::{ZulipStreamer, StreamConfig, Verbosity, EventType, ChannelConfig};
 pub use zulip_tool::{ZulipTool, ZulipMessage};
 pub use recursive_survey::{RecursiveSurvey, SurveyDefinition, SurveyQuestion, SurveyBuilder};
+pub use benchmark::{
+    SWEBenchInstance, SWEBenchLoader, SWEBenchRunner,
+    BenchmarkConfig, DatasetVariant, RunResult, RunSummary, Prediction, TraceEvent,
+    run_swebench_evaluation, analyze_trace_for_smartread, SmartReadAnalysis,
+};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

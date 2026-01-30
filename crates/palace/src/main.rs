@@ -170,6 +170,93 @@ enum Commands {
         #[arg(long, default_value = "normal")]
         verbosity: String,
     },
+
+    /// Run SWE-bench benchmark
+    Bench {
+        /// Dataset variant: lite, full, verified
+        #[arg(long, default_value = "lite")]
+        dataset: String,
+
+        /// Limit number of instances to run
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// LLM endpoint URL (uses Z.ai API if not provided)
+        #[arg(long)]
+        llm_url: Option<String>,
+
+        /// Model name
+        #[arg(long, default_value = "GLM-4.7")]
+        model: String,
+
+        /// Timeout per instance in seconds
+        #[arg(long, default_value = "900")]
+        timeout: u64,
+
+        /// Number of parallel workers (default: 12)
+        #[arg(long, short = 'j', default_value = "12")]
+        parallel: usize,
+
+        /// Output file for predictions (JSONL)
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Local JSONL file instead of HuggingFace
+        #[arg(long)]
+        file: Option<PathBuf>,
+
+        /// Working directory for cloned repos
+        #[arg(long, default_value = "/opt/swebench")]
+        work_dir: PathBuf,
+    },
+
+    /// Race variants of a single SWE-bench instance to find optimal approach
+    Race {
+        /// Instance ID to race (e.g., "django__django-10914")
+        instance_id: String,
+
+        /// Number of variants to run
+        #[arg(long, short = 'n', default_value = "5")]
+        variants: usize,
+
+        /// LLM endpoint URL
+        #[arg(long)]
+        llm_url: Option<String>,
+
+        /// Model name
+        #[arg(long, default_value = "GLM-4.7")]
+        model: String,
+
+        /// Working directory for cloned repos
+        #[arg(long, default_value = "/opt/swebench")]
+        work_dir: PathBuf,
+
+        /// Output directory for race results
+        #[arg(long, default_value = "/tmp/palace-race")]
+        output_dir: PathBuf,
+
+        /// Analyze existing trace file instead of running
+        #[arg(long)]
+        analyze: Option<PathBuf>,
+    },
+
+    /// Evaluate SWE-bench predictions using official harness
+    Eval {
+        /// Predictions file (JSONL)
+        predictions: PathBuf,
+
+        /// Dataset variant: lite, full, verified
+        #[arg(long, default_value = "lite")]
+        dataset: String,
+
+        /// Number of parallel workers (default: 75% of CPU cores, max 12)
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Run ID for this evaluation
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -660,6 +747,193 @@ fn main() -> anyhow::Result<()> {
                 let project_path = std::env::current_dir()?;
                 pool.run(project_path).await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+
+        Commands::Bench { dataset, limit, llm_url, model, timeout, parallel, output, file, work_dir } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                use director::{SWEBenchLoader, SWEBenchRunner, BenchmarkConfig, DatasetVariant};
+                use std::time::Duration;
+
+                println!("🏛️  Palace SWE-bench Runner\n");
+
+                // Parse dataset variant
+                let variant = match dataset.as_str() {
+                    "full" => DatasetVariant::Full,
+                    "verified" => DatasetVariant::Verified,
+                    _ => DatasetVariant::Lite,
+                };
+
+                // Load instances
+                let instances = if let Some(path) = file {
+                    println!("📁 Loading from: {}", path.display());
+                    SWEBenchLoader::from_file(path)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?
+                } else {
+                    println!("🤗 Loading {} dataset from HuggingFace...", dataset);
+                    SWEBenchLoader::from_huggingface(variant, limit)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?
+                };
+
+                let instance_count = if let Some(n) = limit {
+                    instances.len().min(n)
+                } else {
+                    instances.len()
+                };
+                println!("   {} instances loaded\n", instance_count);
+
+                // Determine LLM URL
+                let llm_url = llm_url.unwrap_or_else(|| {
+                    if std::env::var("ZAI_API_KEY").is_ok() {
+                        "https://api.z.ai/api/anthropic".to_string()
+                    } else {
+                        "http://localhost:1234/v1".to_string()
+                    }
+                });
+
+                // Create runner
+                let config = BenchmarkConfig {
+                    llm_url: llm_url.clone(),
+                    api_key: std::env::var("ZAI_API_KEY").ok(),
+                    model: model.clone(),
+                    timeout: Duration::from_secs(timeout),
+                    max_tokens: 65536,
+                    work_dir,
+                };
+
+                println!("🤖 Model: {}", model);
+                println!("🌐 Endpoint: {}", llm_url);
+                println!("⏱️  Timeout: {}s per instance", timeout);
+                if parallel > 1 {
+                    println!("🚀 Parallel workers: {}", parallel);
+                }
+                println!();
+
+                let mut runner = SWEBenchRunner::new(config);
+
+                // Run instances
+                let instances_to_run = if let Some(n) = limit {
+                    &instances[..instances.len().min(n)]
+                } else {
+                    &instances[..]
+                };
+
+                let summary = if parallel > 1 {
+                    runner.run_batch_parallel(instances_to_run, parallel).await
+                } else {
+                    runner.run_batch(instances_to_run).await
+                };
+
+                // Print summary
+                println!("\n═══════════════════════════════════════════════════════");
+                println!("📊 Results: {}/{} successful ({:.1}%)",
+                    summary.success,
+                    summary.total,
+                    (summary.success as f64 / summary.total as f64) * 100.0
+                );
+                println!("⏱️  Total: {:.1}s, Average: {:.1}s per instance",
+                    summary.total_duration.as_secs_f32(),
+                    summary.avg_duration.as_secs_f32()
+                );
+                println!("═══════════════════════════════════════════════════════\n");
+
+                // Write predictions - always save to default location
+                let output_path = output.unwrap_or_else(|| {
+                    PathBuf::from(format!("/tmp/swebench-palace/predictions_{}.jsonl",
+                        chrono::Utc::now().format("%Y%m%d_%H%M%S")))
+                });
+
+                runner.write_predictions(&output_path, &model)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                println!("📝 Predictions written to: {}", output_path.display());
+
+                // Show how to evaluate
+                if summary.success > 0 {
+                    println!("\n💡 To evaluate with official harness:");
+                    println!("   pal eval {} --dataset {}", output_path.display(), dataset);
+                }
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+
+        Commands::Race { instance_id, variants, llm_url, model, work_dir, output_dir, analyze } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                use director::{TraceEvent, analyze_trace_for_smartread};
+
+                println!("🏎️  Palace Race Mode\n");
+                println!("Instance: {}", instance_id);
+
+                // If analyzing existing trace
+                if let Some(trace_path) = analyze {
+                    println!("📊 Analyzing trace: {}\n", trace_path.display());
+
+                    let trace_content = std::fs::read_to_string(&trace_path)?;
+                    let events: Vec<TraceEvent> = trace_content
+                        .lines()
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect();
+
+                    let analysis = analyze_trace_for_smartread(&events);
+                    println!("{}", analysis);
+
+                    return Ok::<(), anyhow::Error>(());
+                }
+
+                // TODO: Implement variant racing
+                // For now, just run the instance once and analyze
+                println!("🚧 Variant racing not yet implemented");
+                println!("   Use --analyze <trace.jsonl> to analyze existing traces");
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+
+        Commands::Eval { predictions, dataset, workers, run_id } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                use director::{run_swebench_evaluation, DatasetVariant};
+
+                println!("🏛️  Palace SWE-bench Evaluator\n");
+
+                // Parse dataset variant
+                let variant = match dataset.as_str() {
+                    "full" => DatasetVariant::Full,
+                    "verified" => DatasetVariant::Verified,
+                    _ => DatasetVariant::Lite,
+                };
+
+                // Calculate workers (75% of cores, max 12)
+                let num_workers = workers.unwrap_or_else(|| {
+                    let cores = num_cpus::get();
+                    ((cores as f64 * 0.75) as usize).min(12).max(1)
+                });
+
+                println!("📁 Predictions: {}", predictions.display());
+                println!("📊 Dataset: {}", dataset);
+                println!("🔧 Workers: {}\n", num_workers);
+
+                let result = run_swebench_evaluation(
+                    &predictions,
+                    variant,
+                    num_workers,
+                    run_id.as_deref(),
+                ).await;
+
+                match result {
+                    Ok(output) => {
+                        println!("✅ Evaluation complete!\n");
+                        println!("{}", output);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Evaluation failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
 
                 Ok::<(), anyhow::Error>(())
             })?;

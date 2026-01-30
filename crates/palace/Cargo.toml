@@ -59,6 +59,7 @@ pollster = "0.4"
 
 # Frame timing
 spin_sleep = "1"
+num_cpus = "1.17.0"
 
 [features]
 default = []
