@@ -394,6 +394,13 @@ impl SWEBenchRunner {
                         success: Some(success),
                     }
                 }
+                _ => TraceEvent {
+                    time_ms,
+                    event_type: "model_event".to_string(),
+                    tool: None,
+                    content: String::new(),
+                    success: None,
+                }
             };
             if let Ok(mut t) = trace_clone.lock() {
                 t.push(trace_event);
@@ -654,6 +661,13 @@ impl SWEBenchRunner {
                         content: output,
                         success: Some(success),
                     }
+                }
+                _ => TraceEvent {
+                    time_ms,
+                    event_type: "model_event".to_string(),
+                    tool: None,
+                    content: String::new(),
+                    success: None,
                 }
             };
             trace_clone.lock().unwrap().push(trace_event);

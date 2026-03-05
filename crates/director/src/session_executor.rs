@@ -455,6 +455,9 @@ impl SessionExecutor {
                         }
                         last_tool_msg = None;
                     }
+                    _ => {
+                        // Ignore non-tool events (e.g. streaming text) for forward compatibility.
+                    }
                 }
             }
         });
