@@ -123,7 +123,7 @@ enum Commands {
 
     /// Call a Palace tool directly (for Claude Code integration)
     Call {
-        /// Tool name: create-issue, list-issues, update-issue
+        /// Tool name: plane, smart_read, smart_write, search, zulip, tools
         tool: String,
 
         /// JSON input for the tool
@@ -1086,11 +1086,15 @@ async fn handle_session_command(cmd: SessionCommands) -> anyhow::Result<()> {
             if should_run {
                 println!();
 
+                let workspace_slug = std::env::var("PLANE_WORKSPACE_SLUG")
+                    .or_else(|_| std::env::var("PLANE_WORKSPACE"))
+                    .unwrap_or_else(|_| "wings".to_string());
+
                 let exec_config = director::SessionExecutorConfig {
                     llm_url,
                     model,
                     max_tokens: 4096,
-                    workspace: "wings".to_string(),
+                    workspace: workspace_slug,
                     project: "PAL".to_string(),
                     zulip_enabled: false,
                     zulip_stream: "palace".to_string(),
@@ -1186,12 +1190,16 @@ async fn handle_session_command(cmd: SessionCommands) -> anyhow::Result<()> {
             println!("  Strategy: {}", sess.strategy);
             println!();
 
+            let workspace_slug = std::env::var("PLANE_WORKSPACE_SLUG")
+                .or_else(|_| std::env::var("PLANE_WORKSPACE"))
+                .unwrap_or_else(|_| "wings".to_string());
+
             // Create executor config
             let exec_config = director::SessionExecutorConfig {
                 llm_url,
                 model,
                 max_tokens: 4096,
-                workspace: "wings".to_string(),
+                workspace: workspace_slug,
                 project: "PAL".to_string(),
                 zulip_enabled: false,
                 zulip_stream: "palace".to_string(),
@@ -1282,8 +1290,7 @@ fn parse_single_target(target: &str) -> anyhow::Result<director::SingleTarget> {
 /// Available tools:
 /// - smart_read: Token-efficient code reading with layered analysis
 /// - smart_write: Structure-aware code editing
-/// - plane_create_issue: Create Plane.so issue
-/// - plane_list_issues: List Plane.so issues
+/// - plane: Unified Plane.so API (use verb/type JSON in --input)
 /// - tools: List available tools
 async fn handle_call(
     tool: &str,
@@ -1355,11 +1362,25 @@ async fn handle_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or("issue");
 
+            // Merge CLI flags into params so `--project` / `--workspace` work
+            // even when omitted from --input JSON.
+            let mut plane_params = input_map.clone();
+            if !plane_params.contains_key("workspace") {
+                if let Some(w) = workspace {
+                    plane_params.insert("workspace".to_string(), serde_json::Value::String(w.to_string()));
+                }
+            }
+            if !plane_params.contains_key("project") {
+                if let Some(p) = project {
+                    plane_params.insert("project".to_string(), serde_json::Value::String(p.to_string()));
+                }
+            }
+
             let ws = input_map.get("workspace").and_then(|v| v.as_str())
                 .or(workspace)
                 .unwrap_or("wings");
 
-            handle_plane(verb, object_type, ws, &input_map).await?;
+            handle_plane(verb, object_type, ws, &plane_params).await?;
         }
 
         "zulip" => {
@@ -1455,7 +1476,9 @@ async fn handle_call(
             println!("                     {{\"verb\": \"messages\", \"stream\": \"palace\", \"topic\": \"director/tealc\", \"limit\": 5}}");
             println!("                     {{\"verb\": \"poll\", \"topic\": \"votes\", \"question\": \"Yes?\", \"options\": [\"Yes\", \"No\"]}}");
             println!();
-            println!("Usage: pal call <tool> --input '<json>'");
+            println!("Usage:");
+            println!("  pal call plane --input '{{\"verb\":\"get\",\"type\":\"issue\",\"id\":\"PAL-42\"}}'");
+            println!("  pal call <tool> --input '<json>'");
         }
 
         _ => {
@@ -1760,13 +1783,14 @@ async fn handle_plane(
         ("get", "issue" | "issues") => {
             let project = params.get("project").and_then(|v| v.as_str())
                 .context("project required")?;
-            let issue_id = params.get("id").and_then(|v| v.as_str())
+            let issue_id_input = params.get("id").and_then(|v| v.as_str())
                 .context("id required (issue UUID or sequence like PAL-123)")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+            let issue_uuid = resolve_issue_id(&client, &api_url, &api_key, workspace, &project_id, issue_id_input).await?;
 
             rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
-                api_url, workspace, project_id, issue_id);
+                api_url, workspace, project_id, issue_uuid);
             let resp: serde_json::Value = client.get(&url)
                 .header("X-API-Key", &api_key)
                 .send().await?.json().await?;
@@ -1894,18 +1918,19 @@ async fn handle_plane(
         ("delete", "issue" | "issues") => {
             let project = params.get("project").and_then(|v| v.as_str())
                 .context("project required")?;
-            let issue_id = params.get("id").and_then(|v| v.as_str())
+            let issue_id_input = params.get("id").and_then(|v| v.as_str())
                 .context("id required")?;
             let project_id = get_project_id(&client, &api_url, &api_key, workspace, project).await?;
+            let issue_uuid = resolve_issue_id(&client, &api_url, &api_key, workspace, &project_id, issue_id_input).await?;
 
             rate_limiter.lock().await.acquire().await;
             let url = format!("{}/workspaces/{}/projects/{}/issues/{}/",
-                api_url, workspace, project_id, issue_id);
+                api_url, workspace, project_id, issue_uuid);
             client.delete(&url)
                 .header("X-API-Key", &api_key)
                 .send().await?;
 
-            println!("Deleted: {}", issue_id);
+            println!("Deleted: {}", issue_id_input);
         }
 
         // === CYCLES ===

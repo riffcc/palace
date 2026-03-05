@@ -24,6 +24,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+const DEFAULT_SESSION_SKILLS: &[&str] = &["agentic-automation"];
+
 /// Configuration for session execution.
 #[derive(Debug, Clone)]
 pub struct SessionExecutorConfig {
@@ -105,6 +107,12 @@ impl SessionExecutor {
                 all_skills.push(skill.clone());
             }
         }
+        for default_skill in DEFAULT_SESSION_SKILLS {
+            let default_skill = default_skill.to_string();
+            if !all_skills.contains(&default_skill) {
+                all_skills.push(default_skill);
+            }
+        }
 
         for skill_path in &all_skills {
             // Try to load as a file path first
@@ -117,10 +125,17 @@ impl SessionExecutor {
                 }
             } else {
                 // Try to load from standard locations
+                let home = std::env::var("HOME").unwrap_or_default();
+                let codex_home = std::env::var("CODEX_HOME")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| format!("{}/.codex", home));
                 let locations = [
                     session.project_path.join(".palace/skills").join(format!("{}.md", skill_path)),
                     session.project_path.join(".claude/commands").join(format!("{}.md", skill_path)),
-                    PathBuf::from(format!("{}/.claude/commands/{}.md", std::env::var("HOME").unwrap_or_default(), skill_path)),
+                    PathBuf::from(format!("{}/.claude/commands/{}.md", home, skill_path)),
+                    PathBuf::from(format!("{}/skills/{}/SKILL.md", codex_home, skill_path)),
+                    PathBuf::from(format!("{}/skills/{}.md", codex_home, skill_path)),
                 ];
 
                 let mut found = false;
@@ -419,35 +434,6 @@ impl SessionExecutor {
 
             while let Some(event) = rx.recv().await {
                 match event {
-                    ToolEvent::Text { text } => {
-                        // Check if this is a thinking block
-                        if text.contains("<think>") || text.contains("</think>") {
-                            // Extract thinking content, strip tags and all whitespace
-                            let thinking: String = text
-                                .replace("<think>", "")
-                                .replace("</think>", "")
-                                .chars()
-                                .filter(|c| !c.is_whitespace())
-                                .collect();
-
-                            // Only emit if there's actual content (not just whitespace/tags)
-                            if !thinking.is_empty() {
-                                // Use original with tags stripped but whitespace preserved for readability
-                                let display = text
-                                    .replace("<think>", "")
-                                    .replace("</think>", "");
-                                let display = display.trim();
-                                let msg = format!("```spoiler 💭 Thinking\n{}\n```", display);
-                                let _ = zulip.send(&stream, &topic, &msg).await;
-                            }
-                        } else {
-                            // Normal text - emit as-is if non-empty
-                            let text = text.trim();
-                            if !text.is_empty() {
-                                let _ = zulip.send(&stream, &topic, text).await;
-                            }
-                        }
-                    }
                     ToolEvent::ToolCall { name, input } => {
                         // Send tool call with nice formatting
                         let (emoji, display_name) = format_tool_name(&name);

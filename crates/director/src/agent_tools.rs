@@ -4,6 +4,7 @@
 //! so they can be used in agentic loops.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -212,7 +213,9 @@ impl PlaneAgentTool {
 
     /// Create from environment or defaults.
     pub fn from_env() -> Self {
-        let workspace = std::env::var("PLANE_WORKSPACE").unwrap_or_else(|_| "wings".to_string());
+        let workspace = std::env::var("PLANE_WORKSPACE_SLUG")
+            .or_else(|_| std::env::var("PLANE_WORKSPACE"))
+            .unwrap_or_else(|_| "wings".to_string());
         let project = std::env::var("PLANE_PROJECT").unwrap_or_else(|_| "PAL".to_string());
         Self { workspace, project }
     }
@@ -249,7 +252,7 @@ impl Tool for PlaneAgentTool {
             .and_then(|v| v.as_str())
             .unwrap_or(&self.project);
 
-        // Use pal call plane internally to avoid duplicating API logic
+        // Use palace call plane internally to avoid duplicating API logic.
         let mut args = serde_json::json!({
             "verb": verb,
             "project": project,
@@ -262,27 +265,45 @@ impl Tool for PlaneAgentTool {
             }
         }
 
-        // Shell out to pal call plane
-        let output = tokio::process::Command::new("pal")
-            .arg("call")
-            .arg("plane")
-            .arg("--input")
-            .arg(args.to_string())
-            .output()
-            .await;
+        // Prefer `palace`; fallback to legacy `pal`.
+        for cli in ["palace", "pal"] {
+            let mut cmd = tokio::process::Command::new(cli);
+            cmd.arg("call")
+                .arg("plane")
+                .arg("--input")
+                .arg(args.to_string());
 
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if out.status.success() {
-                    ToolResult::success(stdout.to_string())
-                } else {
-                    ToolResult::error(format!("{}\n{}", stdout, stderr))
+            // Forward Plane auth/workspace env explicitly so child processes
+            // can use the same credentials when available.
+            if let Ok(api_key) = std::env::var("PLANE_API_KEY") {
+                cmd.env("PLANE_API_KEY", api_key);
+            }
+            let workspace_slug = std::env::var("PLANE_WORKSPACE_SLUG")
+                .or_else(|_| std::env::var("PLANE_WORKSPACE"))
+                .unwrap_or_else(|_| self.workspace.clone());
+            cmd.env("PLANE_WORKSPACE_SLUG", &workspace_slug);
+            cmd.env("PLANE_WORKSPACE", &workspace_slug);
+            cmd.env("PLANE_PROJECT", &self.project);
+
+            let output = cmd.output().await;
+
+            match output {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if out.status.success() {
+                        return ToolResult::success(stdout.to_string());
+                    }
+                    return ToolResult::error(format!("{}\n{}", stdout, stderr));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return ToolResult::error(format!("Failed to call {}: {}", cli, e));
                 }
             }
-            Err(e) => ToolResult::error(format!("Failed to call pal: {}", e)),
         }
+
+        ToolResult::error("Failed to call Plane CLI: neither `palace` nor `pal` found in PATH")
     }
 }
 

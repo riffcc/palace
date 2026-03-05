@@ -238,9 +238,11 @@ impl Executor {
 
     /// Execute issue creation via Plane API.
     async fn execute_create_issue(&self, issue: &crate::issues::Issue) -> DirectorResult<StepResult> {
-        // Use pal call plane to create issue
+        // Use palace call plane to create issue (fallback to legacy `pal`).
         let cmd = format!(
-            r#"./target/debug/pal call plane --input '{{"verb": "create", "type": "issue", "project": "PAL", "name": "{}", "priority": "{}"}}'"#,
+            r#"(palace call plane --input '{{"verb": "create", "type": "issue", "project": "PAL", "name": "{}", "priority": "{}"}}' || pal call plane --input '{{"verb": "create", "type": "issue", "project": "PAL", "name": "{}", "priority": "{}"}}')"#,
+            issue.title.replace('\'', "\\'"),
+            format!("{:?}", issue.priority).to_lowercase(),
             issue.title.replace('\'', "\\'"),
             format!("{:?}", issue.priority).to_lowercase()
         );

@@ -370,15 +370,6 @@ impl SWEBenchRunner {
         let callback = Arc::new(move |event: ToolEvent| {
             let time_ms = start_time.elapsed().as_millis() as u64;
             let trace_event = match event {
-                ToolEvent::Text { text } => {
-                    TraceEvent {
-                        time_ms,
-                        event_type: "text".to_string(),
-                        tool: None,
-                        content: text,
-                        success: None,
-                    }
-                }
                 ToolEvent::ToolCall { name, input } => {
                     let input_str = serde_json::to_string(&input).unwrap_or_default();
                     let preview = if input_str.len() > 80 { format!("{}...", &input_str[..80]) } else { input_str.clone() };
@@ -622,22 +613,6 @@ impl SWEBenchRunner {
         let callback = Arc::new(move |event: ToolEvent| {
             let time_ms = start_time.elapsed().as_millis() as u64;
             let trace_event = match event {
-                ToolEvent::Text { text } => {
-                    // Log model reasoning
-                    let preview = if text.len() > 200 {
-                        format!("{}...", &text[..200])
-                    } else {
-                        text.clone()
-                    };
-                    tracing::debug!("[{:>6}ms] 💭 {}", time_ms, preview);
-                    TraceEvent {
-                        time_ms,
-                        event_type: "text".to_string(),
-                        tool: None,
-                        content: text,
-                        success: None,
-                    }
-                }
                 ToolEvent::ToolCall { name, input } => {
                     let input_str = serde_json::to_string(&input).unwrap_or_default();
                     let preview = if input_str.len() > 100 {
