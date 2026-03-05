@@ -1,3 +1,3 @@
 [submodule "crates/llm-code-sdk"]
 	path = crates/llm-code-sdk
-	url = https://github.com/rifflabs/llm-code-sdk.git
+	url = https://github.com/riffcc/llm-code-sdk.git

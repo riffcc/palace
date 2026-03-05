@@ -140,14 +140,14 @@ to be cloned alongside it:
 
 ```bash
 # Clone Palace and initialize submodules
-git clone https://github.com/rifflabs/palace.git
+git clone https://github.com/riffcc/palace.git
 cd palace
 git submodule update --init --recursive
 
 # Clone required external dependencies (at the same level as palace/)
 cd ..
-git clone https://github.com/rifflabs/minirust-search.git
-git clone https://github.com/rifflabs/tree-sitter-nim.git tree-sitter-nim-fork
+git clone https://github.com/riffcc/minirust-search.git
+git clone https://github.com/riffcc/tree-sitter-nim.git tree-sitter-nim-fork
 cd palace
 ```
 
