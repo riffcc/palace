@@ -25,6 +25,9 @@ mod inference;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -139,6 +142,21 @@ enum Commands {
         workspace: Option<String>,
 
         /// Plane.so project slug (auto-init if needed)
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Run a minimal MCP stdio server that exposes palace-call
+    Mcp {
+        /// Project directory used as the default call root
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Plane.so workspace slug default
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Plane.so project slug default
         #[arg(long)]
         project: Option<String>,
     },
@@ -686,6 +704,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Call { tool, input, path, workspace, project } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(handle_call(&tool, input.as_deref(), &path, workspace.as_deref(), project.as_deref()))?;
+        }
+
+        Commands::Mcp { path, workspace, project } => {
+            run_mcp_server(&path, workspace.as_deref(), project.as_deref())?;
         }
 
         Commands::Daemon => {
@@ -1299,9 +1321,6 @@ async fn handle_call(
     workspace: Option<&str>,
     project: Option<&str>,
 ) -> anyhow::Result<()> {
-    use llm_code_sdk::tools::Tool;
-    use std::collections::HashMap;
-
     // Parse JSON input if provided
     // Note: Shell escaping can turn `!` into `\!` which is invalid JSON.
     // We unescape it here since `\!` is never valid JSON anyway.
@@ -1311,6 +1330,20 @@ async fn handle_call(
     } else {
         HashMap::new()
     };
+
+    let output = execute_call(tool, input_map, path, workspace, project).await?;
+    println!("{}", output);
+    Ok(())
+}
+
+async fn execute_call(
+    tool: &str,
+    input_map: HashMap<String, serde_json::Value>,
+    path: &std::path::Path,
+    workspace: Option<&str>,
+    project: Option<&str>,
+) -> anyhow::Result<String> {
+    use llm_code_sdk::tools::Tool;
 
     // Resolve project path
     let project_path = path.canonicalize()
@@ -1324,10 +1357,9 @@ async fn handle_call(
             // JECJIT: Inject related issue context if project config exists
             let jecjit_context = inject_jecjit_context(&project_path, &input_map).await;
             if !jecjit_context.is_empty() && !result.is_error() {
-                let enhanced = format!("{}\n{}", result.to_content_string(), jecjit_context);
-                println!("{}", enhanced);
+                Ok(format!("{}\n{}", result.to_content_string(), jecjit_context))
             } else {
-                print_tool_result(&result);
+                render_tool_result(&result)
             }
         }
 
@@ -1338,17 +1370,16 @@ async fn handle_call(
             // JECJIT: Surface related issues for the file being written
             let jecjit_context = inject_jecjit_context(&project_path, &input_map).await;
             if !jecjit_context.is_empty() && !result.is_error() {
-                let enhanced = format!("{}\n{}", result.to_content_string(), jecjit_context);
-                println!("{}", enhanced);
+                Ok(format!("{}\n{}", result.to_content_string(), jecjit_context))
             } else {
-                print_tool_result(&result);
+                render_tool_result(&result)
             }
         }
 
         "search" => {
             let search = llm_code_sdk::tools::SearchTool::new(&project_path);
             let result = search.call(input_map).await;
-            print_tool_result(&result);
+            render_tool_result(&result)
         }
 
         "plane" => {
@@ -1380,7 +1411,7 @@ async fn handle_call(
                 .or(workspace)
                 .unwrap_or("wings");
 
-            handle_plane(verb, object_type, ws, &plane_params).await?;
+            Ok(handle_plane_capture(verb, object_type, ws, &plane_params).await?)
         }
 
         "zulip" => {
@@ -1405,7 +1436,7 @@ async fn handle_call(
 
                     let msg_id = zulip.send(stream, topic, content).await
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    println!("Sent message {} to {}/{}", msg_id, stream, topic);
+                    Ok(format!("Sent message {} to {}/{}", msg_id, stream, topic))
                 }
                 "messages" | "get" => {
                     let stream = input_map.get("stream")
@@ -1419,9 +1450,11 @@ async fn handle_call(
 
                     let messages = zulip.get_messages(stream, topic, limit).await
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    for msg in messages {
-                        println!("---\n{}", msg.content);
-                    }
+                    Ok(messages
+                        .into_iter()
+                        .map(|msg| format!("---\n{}", msg.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
                 }
                 "poll" => {
                     let stream = input_map.get("stream")
@@ -1440,64 +1473,334 @@ async fn handle_call(
 
                     let msg_id = zulip.send_poll(stream, topic, question, &options).await
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    println!("Created poll {} in {}/{}", msg_id, stream, topic);
+                    Ok(format!("Created poll {} in {}/{}", msg_id, stream, topic))
                 }
                 _ => anyhow::bail!("Unknown zulip verb: '{}'. Use: send, messages, poll", verb),
             }
         }
 
         "tools" | "list" | "help" => {
-            println!("Available Palace tools (not in Claude Code):\n");
-            println!("  smart_read       Token-efficient code reading with 5-layer analysis");
-            println!("                   Layers: raw, ast, call_graph, cfg, dfg, pdg");
-            println!("                   Input: {{\"path\": \"...\", \"layer\": \"ast\", \"symbol\": \"...\"}}");
-            println!("                   Batch: {{\"reads\": [{{\"path\": \"...\", \"layer\": \"...\"}}, ...]}}");
-            println!();
-            println!("  smart_write      Structure-aware code editing");
-            println!("                   Operations: replace_function, replace_symbol, insert_after, delete, replace_lines");
-            println!("                   Input: {{\"path\": \"...\", \"operation\": \"...\", \"target\": \"...\", \"content\": \"...\"}}");
-            println!();
-            println!("  search           MRS-based semantic code search");
-            println!("                   Input: {{\"query\": \"...\", \"limit\": \"10\"}}");
-            println!("                   Indexes codebase on demand, returns ranked results");
-            println!();
-            println!("  plane            Unified Plane.so API (systemd-style)");
-            println!("                   Format: {{\"verb\": \"...\", \"type\": \"...\", ...}}");
-            println!("                   Type defaults to 'issue' if omitted");
-            println!();
-            println!("                   Verbs: list, get, create, update, delete, raw");
-            println!("                   Types: project, issue, cycle, module, label, state, member");
-            println!();
-            println!("  zulip            Zulip messaging API");
-            println!("                   Verbs: send, messages, poll");
-            println!();
-            println!("                   Examples:");
-            println!("                     {{\"verb\": \"send\", \"stream\": \"palace\", \"topic\": \"test\", \"content\": \"Hello!\"}}");
-            println!("                     {{\"verb\": \"messages\", \"stream\": \"palace\", \"topic\": \"director/tealc\", \"limit\": 5}}");
-            println!("                     {{\"verb\": \"poll\", \"topic\": \"votes\", \"question\": \"Yes?\", \"options\": [\"Yes\", \"No\"]}}");
-            println!();
-            println!("Usage:");
-            println!("  pal call plane --input '{{\"verb\":\"get\",\"type\":\"issue\",\"id\":\"PAL-42\"}}'");
-            println!("  pal call <tool> --input '<json>'");
+            Ok(call_help_text())
         }
 
-        _ => {
-            anyhow::bail!(
-                "Unknown tool: '{}'\nRun 'pal call tools' to see available tools.",
-                tool
-            );
+        _ => Ok(format!(
+            "Unknown tool: '{}'\n\n{}",
+            tool,
+            call_help_text()
+        )),
+    }
+}
+
+fn render_tool_result(result: &llm_code_sdk::tools::ToolResult) -> anyhow::Result<String> {
+    if result.is_error() {
+        anyhow::bail!("{}", result.to_content_string());
+    }
+    Ok(result.to_content_string())
+}
+
+fn call_help_text() -> String {
+    [
+        "Available Palace call tools:",
+        "",
+        "  smart_read       Token-efficient code reading with 5-layer analysis",
+        "                   Layers: raw, ast, call_graph, cfg, dfg, pdg",
+        "                   Input: {\"path\": \"...\", \"layer\": \"ast\", \"symbol\": \"...\"}",
+        "                   Batch: {\"reads\": [{\"path\": \"...\", \"layer\": \"...\"}, ...]}",
+        "",
+        "  smart_write      Structure-aware code editing",
+        "                   Operations: replace_function, replace_symbol, insert_after, delete, replace_lines",
+        "                   Input: {\"path\": \"...\", \"operation\": \"...\", \"target\": \"...\", \"content\": \"...\"}",
+        "",
+        "  search           MRS-based semantic code search",
+        "                   Input: {\"query\": \"...\", \"limit\": 10}",
+        "",
+        "  plane            Unified Plane.so API",
+        "                   Format: {\"verb\": \"...\", \"type\": \"...\", ...}",
+        "                   Verbs: list, get, create, update, delete, raw",
+        "                   Types: project, issue, cycle, module, label, state, member",
+        "",
+        "  zulip            Zulip messaging API",
+        "                   Verbs: send, messages, poll",
+        "",
+        "Usage:",
+        "  palace-call with tool='plane' and input={\"verb\":\"get\",\"type\":\"issue\",\"id\":\"PAL-42\"}",
+        "  pal call <tool> --input '<json>'",
+    ]
+    .join("\n")
+}
+
+async fn handle_plane_capture(
+    _verb: &str,
+    _object_type: &str,
+    workspace: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let exe = std::env::current_exe().context("Failed to resolve palace executable")?;
+    let mut command = std::process::Command::new(exe);
+    let input = serde_json::to_string(params).context("Failed to serialize plane input")?;
+
+    command
+        .arg("call")
+        .arg("plane")
+        .arg("--input")
+        .arg(input)
+        .arg("--workspace")
+        .arg(workspace);
+
+    if let Some(project) = params.get("project").and_then(|v| v.as_str()) {
+        command.arg("--project").arg(project);
+    }
+
+    let output = command.output().context("Failed to execute palace call plane")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "palace call plane failed with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("Plane output was not valid UTF-8")?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn run_mcp_server(
+    path: &std::path::Path,
+    workspace: Option<&str>,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    loop {
+        let Some(request) = read_mcp_message(&mut reader)? else {
+            break;
+        };
+
+        let method = request
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let id = request.get("id").cloned();
+
+        let response = match method {
+            "initialize" => Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {
+                            "listChanged": false
+                        }
+                    },
+                    "serverInfo": {
+                        "name": "palace-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": "Use the palace-call tool to invoke a Palace call tool. If you are unsure which call tool to use, omit the tool argument or pass 'help' to receive inline help."
+                }
+            })),
+            "notifications/initialized" => None,
+            "tools/list" => Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "palace-call",
+                            "description": "Invoke one Palace call tool such as smart_read, smart_write, search, plane, or zulip. If tool is omitted, 'help', or unknown, returns usage help instead of failing.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {
+                                        "type": "string",
+                                        "description": "Palace call tool name. Use 'help' or omit to get usage."
+                                    },
+                                    "input": {
+                                        "type": "object",
+                                        "description": "JSON object passed to the Palace tool.",
+                                        "additionalProperties": true
+                                    },
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Project directory for the tool call. Defaults to the MCP server path."
+                                    },
+                                    "workspace": {
+                                        "type": "string",
+                                        "description": "Default Plane workspace slug when using the plane tool."
+                                    },
+                                    "project": {
+                                        "type": "string",
+                                        "description": "Default Plane project slug when using the plane tool."
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            })),
+            "tools/call" => Some(handle_mcp_tool_call(id, request.get("params"), path, workspace, project, &runtime)),
+            _ => {
+                if id.is_some() {
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Method not found: {}", method)
+                        }
+                    }))
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(response) = response {
+            write_mcp_message(&mut writer, &response)?;
         }
     }
+
     Ok(())
 }
 
-fn print_tool_result(result: &llm_code_sdk::tools::ToolResult) {
-    if result.is_error() {
-        eprintln!("Error: {}", result.to_content_string());
-        std::process::exit(1);
-    } else {
-        println!("{}", result.to_content_string());
+fn handle_mcp_tool_call(
+    id: Option<Value>,
+    params: Option<&Value>,
+    default_path: &std::path::Path,
+    default_workspace: Option<&str>,
+    default_project: Option<&str>,
+    runtime: &tokio::runtime::Runtime,
+) -> Value {
+    let params = params.cloned().unwrap_or_else(|| json!({}));
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    if name != "palace-call" {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32602,
+                "message": format!("Unknown tool: {}", name)
+            }
+        });
     }
+
+    let arguments = params
+        .get("arguments")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let tool = arguments
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("help");
+
+    let input_map: HashMap<String, Value> = arguments
+        .get("input")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
+    let call_path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default_path.to_path_buf());
+
+    let workspace = arguments
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .or(default_workspace);
+
+    let project = arguments
+        .get("project")
+        .and_then(|v| v.as_str())
+        .or(default_project);
+
+    let result = runtime.block_on(execute_call(
+        tool,
+        input_map,
+        &call_path,
+        workspace,
+        project,
+    ));
+
+    match result {
+        Ok(output) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": output
+                    }
+                ],
+                "isError": false
+            }
+        }),
+        Err(error) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!("Error: {}", error)
+                    }
+                ],
+                "isError": true
+            }
+        }),
+    }
+}
+
+fn read_mcp_message<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Value>> {
+    let mut content_length = None;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>().context("Invalid Content-Length header")?);
+        }
+    }
+
+    let Some(content_length) = content_length else {
+        anyhow::bail!("Missing Content-Length header");
+    };
+
+    let mut payload = vec![0_u8; content_length];
+    reader.read_exact(&mut payload)?;
+    Ok(Some(serde_json::from_slice(&payload).context("Invalid JSON payload")?))
+}
+
+fn write_mcp_message<W: Write>(writer: &mut W, value: &Value) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(value)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
+    writer.write_all(&payload)?;
+    writer.flush()?;
+    Ok(())
 }
 
 async fn inject_jecjit_context(
