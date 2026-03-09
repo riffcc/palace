@@ -1411,6 +1411,11 @@ async fn execute_call(
                 .or(workspace)
                 .unwrap_or("wings");
 
+            if std::env::var("PALACE_DIRECT_PLANE").as_deref() == Ok("1") {
+                handle_plane(verb, object_type, ws, &plane_params).await?;
+                return Ok(String::new());
+            }
+
             Ok(handle_plane_capture(verb, object_type, ws, &plane_params).await?)
         }
 
@@ -1545,7 +1550,8 @@ async fn handle_plane_capture(
         .arg("--input")
         .arg(input)
         .arg("--workspace")
-        .arg(workspace);
+        .arg(workspace)
+        .env("PALACE_DIRECT_PLANE", "1");
 
     if let Some(project) = params.get("project").and_then(|v| v.as_str()) {
         command.arg("--project").arg(project);
@@ -1581,7 +1587,7 @@ fn run_mcp_server(
     let runtime = tokio::runtime::Runtime::new()?;
 
     loop {
-        let Some(request) = read_mcp_message(&mut reader)? else {
+        let Some((request, next_transport)) = read_mcp_message(&mut reader)? else {
             break;
         };
 
@@ -1666,11 +1672,18 @@ fn run_mcp_server(
         };
 
         if let Some(response) = response {
-            write_mcp_message(&mut writer, &response)?;
+            write_mcp_message(&mut writer, &response, next_transport)?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McpTransport {
+    Unknown,
+    ContentLength,
+    LineDelimited,
 }
 
 fn handle_mcp_tool_call(
@@ -1765,7 +1778,7 @@ fn handle_mcp_tool_call(
     }
 }
 
-fn read_mcp_message<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Value>> {
+fn read_mcp_message<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<(Value, McpTransport)>> {
     let mut content_length = None;
     let mut line = String::new();
 
@@ -1777,12 +1790,18 @@ fn read_mcp_message<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Value>>
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
+        if content_length.is_none() && trimmed.starts_with('{') {
+            let value = serde_json::from_str(trimmed).context("Invalid JSON payload")?;
+            return Ok(Some((value, McpTransport::LineDelimited)));
+        }
         if trimmed.is_empty() {
             break;
         }
 
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("Content-Length") {
             content_length = Some(value.trim().parse::<usize>().context("Invalid Content-Length header")?);
+            }
         }
     }
 
@@ -1792,13 +1811,24 @@ fn read_mcp_message<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Value>>
 
     let mut payload = vec![0_u8; content_length];
     reader.read_exact(&mut payload)?;
-    Ok(Some(serde_json::from_slice(&payload).context("Invalid JSON payload")?))
+    Ok(Some((
+        serde_json::from_slice(&payload).context("Invalid JSON payload")?,
+        McpTransport::ContentLength,
+    )))
 }
 
-fn write_mcp_message<W: Write>(writer: &mut W, value: &Value) -> anyhow::Result<()> {
+fn write_mcp_message<W: Write>(writer: &mut W, value: &Value, transport: McpTransport) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
-    writer.write_all(&payload)?;
+    match transport {
+        McpTransport::LineDelimited | McpTransport::Unknown => {
+            writer.write_all(&payload)?;
+            writer.write_all(b"\n")?;
+        }
+        McpTransport::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
+            writer.write_all(&payload)?;
+        }
+    }
     writer.flush()?;
     Ok(())
 }
@@ -1876,10 +1906,10 @@ async fn handle_plane(
     workspace: &str,
     params: &std::collections::HashMap<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let api_key = std::env::var("PLANE_API_KEY")
-        .context("PLANE_API_KEY not set")?;
-    let api_url = std::env::var("PLANE_API_URL")
-        .unwrap_or_else(|_| "https://api.plane.so/api/v1".to_string());
+    let global = palace_plane::GlobalConfig::load()?;
+    let api_key = global.plane_api_key()
+        .context("Plane.so API key not configured. Set PLANE_API_KEY or add plane_api_key to ~/.palace/credentials.json")?;
+    let api_url = global.plane_url();
 
     let client = reqwest::Client::new();
 
@@ -2814,4 +2844,88 @@ fn parse_numbers(s: &str) -> anyhow::Result<Vec<usize>> {
         .map(|n| n.trim().parse::<usize>())
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid number format. Use comma-separated numbers like: 1,2,3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_mcp_message, write_mcp_message, McpTransport};
+    use serde_json::{json, Value};
+    use std::io::Cursor;
+
+    #[test]
+    fn read_mcp_message_accepts_line_delimited_json() {
+        let mut reader = Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n".to_vec());
+
+        let (message, transport) = read_mcp_message(&mut reader)
+            .expect("line-delimited MCP message should parse")
+            .expect("message should be present");
+
+        assert_eq!(transport, McpTransport::LineDelimited);
+        assert_eq!(message["method"], "initialize");
+        assert_eq!(message["id"], 1);
+    }
+
+    #[test]
+    fn read_mcp_message_accepts_case_insensitive_content_length() {
+        let payload = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
+        let input = format!("content-length: {}\r\n\r\n{}", payload.len(), payload);
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let (message, transport) = read_mcp_message(&mut reader)
+            .expect("content-length MCP message should parse")
+            .expect("message should be present");
+
+        assert_eq!(transport, McpTransport::ContentLength);
+        assert_eq!(message["method"], "tools/list");
+        assert_eq!(message["id"], 2);
+    }
+
+    #[test]
+    fn write_mcp_message_uses_line_delimited_transport() {
+        let mut output = Vec::new();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": { "ok": true }
+        });
+
+        write_mcp_message(&mut output, &message, McpTransport::LineDelimited)
+            .expect("line-delimited MCP response should serialize");
+
+        let rendered = String::from_utf8(output).expect("response should be utf-8");
+        assert_eq!(rendered, format!("{}\n", serde_json::to_string(&message).unwrap()));
+    }
+
+    #[test]
+    fn write_mcp_message_uses_content_length_transport() {
+        let mut output = Vec::new();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": { "ok": true }
+        });
+
+        write_mcp_message(&mut output, &message, McpTransport::ContentLength)
+            .expect("content-length MCP response should serialize");
+
+        let payload = serde_json::to_string(&message).expect("response should serialize");
+        let rendered = String::from_utf8(output).expect("response should be utf-8");
+        assert_eq!(rendered, format!("Content-Length: {}\r\n\r\n{}", payload.len(), payload));
+    }
+
+    #[test]
+    fn write_mcp_message_treats_unknown_transport_as_line_delimited() {
+        let mut output = Vec::new();
+        let message: Value = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": { "ok": true }
+        });
+
+        write_mcp_message(&mut output, &message, McpTransport::Unknown)
+            .expect("unknown transport should fall back to line-delimited");
+
+        let rendered = String::from_utf8(output).expect("response should be utf-8");
+        assert_eq!(rendered, format!("{}\n", serde_json::to_string(&message).unwrap()));
+    }
 }

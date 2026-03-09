@@ -2816,6 +2816,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
+ "tree-sitter-lean",
  "tree-sitter-nim",
  "tree-sitter-perl",
  "tree-sitter-python",
@@ -5681,6 +5682,14 @@ name = "tree-sitter-language"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ae62f7eae5eb549c71b76658648b72cc6111f2d87d24a1e31fa907f4943e3ce"
+
+[[package]]
+name = "tree-sitter-lean"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "tree-sitter-nim"
