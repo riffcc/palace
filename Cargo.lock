@@ -2978,6 +2978,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "minirust-search"
 version = "0.1.0"
+source = "git+https://github.com/riffcc/minirust-search.git?rev=1edaaca3102366bfd9daf4ba4d754353d3c09914#1edaaca3102366bfd9daf4ba4d754353d3c09914"
 dependencies = [
  "clap",
  "serde",
@@ -5686,6 +5687,7 @@ checksum = "4ae62f7eae5eb549c71b76658648b72cc6111f2d87d24a1e31fa907f4943e3ce"
 [[package]]
 name = "tree-sitter-lean"
 version = "0.1.0"
+source = "git+https://github.com/riffcc/tree-sitter-lean.git?rev=8c4fa06ae0ac526d66d2276997c6c5de61343f44#8c4fa06ae0ac526d66d2276997c6c5de61343f44"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -5694,6 +5696,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-nim"
 version = "0.6.2"
+source = "git+https://github.com/riffcc/tree-sitter-nim.git?rev=1fbd0b4017019981294f5fd7bac584e82ba188e2#1fbd0b4017019981294f5fd7bac584e82ba188e2"
 dependencies = [
  "cc",
  "tree-sitter-language",
