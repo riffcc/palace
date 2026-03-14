@@ -610,6 +610,25 @@ async fn main() -> anyhow::Result<()> {
                                     let Some(z) = &zulip_for_events else { continue };
 
                                     match event {
+                                        ToolEvent::Text { text } => {
+                                            let text = text.trim();
+                                            if text.is_empty() {
+                                                continue;
+                                            }
+
+                                            if !current_content.is_empty() {
+                                                current_content.push_str("\n\n");
+                                            }
+                                            current_content.push_str(text);
+
+                                            if let Some(msg_id) = current_msg_id {
+                                                let _ = z.update_message(msg_id, &current_content).await;
+                                            } else if let Ok(msg_id) =
+                                                z.send("palace", &topic, &current_content).await
+                                            {
+                                                current_msg_id = Some(msg_id);
+                                            }
+                                        }
                                         ToolEvent::ToolCall { name, input } => {
                                             let display_name = format_tool_name(&name);
                                             let input_str = format_tool_input(&name, &input);
