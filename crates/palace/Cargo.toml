@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Palace crates
 conductor = { path = "../conductor" }
 director = { path = "../director" }
-llm-code-sdk = { path = "../llm-code-sdk", features = ["smart", "search"] }
+llm-code-sdk = { git = "https://github.com/riffcc/llm-code-sdk.git", rev = "0ef455f86e2f8dbdb292c092d9ebeb0966b214b9", features = ["smart", "search"] }
 mountain = { path = "../mountain" }
 palace-gba = { path = "../palace-gba" }
 palace-plane = { path = "../palace-plane" }

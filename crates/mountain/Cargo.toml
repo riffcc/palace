@@ -14,7 +14,7 @@ description = "Time-delayed cascading LLM control for realtime program automatio
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-llm-code-sdk = { path = "../llm-code-sdk" }
+llm-code-sdk = { git = "https://github.com/riffcc/llm-code-sdk.git", rev = "0ef455f86e2f8dbdb292c092d9ebeb0966b214b9" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

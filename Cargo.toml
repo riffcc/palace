@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/llm-code-sdk"]
 
 # Always optimize the emulator, even in debug builds
 [profile.dev.package.rustboyadvance-core]

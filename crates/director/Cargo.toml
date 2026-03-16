@@ -18,7 +18,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy.workspace = true
 futures.workspace = true
 html-escape = "0.2"
-llm-code-sdk = { path = "../llm-code-sdk", features = ["smart"] }
+llm-code-sdk = { git = "https://github.com/riffcc/llm-code-sdk.git", rev = "0ef455f86e2f8dbdb292c092d9ebeb0966b214b9", features = ["smart"] }
 mountain = { path = "../mountain" }
 palace-plane = { path = "../palace-plane" }
 regex = "1"

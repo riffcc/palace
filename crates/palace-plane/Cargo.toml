@@ -8,7 +8,7 @@ description = "Plane.so integration and task management for Palace"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-llm-code-sdk = { path = "../llm-code-sdk" }
+llm-code-sdk = { git = "https://github.com/riffcc/llm-code-sdk.git", rev = "0ef455f86e2f8dbdb292c092d9ebeb0966b214b9" }
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
